@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.idea/
+# generated macro with local data paths
+legacy/stitch_macro.ijm
