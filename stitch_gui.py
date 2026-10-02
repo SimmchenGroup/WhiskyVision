@@ -98,19 +98,45 @@ roughly how much neighbouring tiles overlap (20 % is typical)."""
 def load_bundled_fonts():
     """Make the bundled Caprasimo / Figtree fonts available to this process only
     (nothing is installed on the computer). Must run before the window opens."""
-    if sys.platform.startswith("win"):
+    paths = glob.glob(os.path.join(FONT_DIR, "*.ttf"))
+    try:
         import ctypes
-        for path in glob.glob(os.path.join(FONT_DIR, "*.ttf")):
-            ctypes.windll.gdi32.AddFontResourceExW(path, 0x10, 0)   # FR_PRIVATE
+        if sys.platform.startswith("win"):
+            for path in paths:
+                ctypes.windll.gdi32.AddFontResourceExW(path, 0x10, 0)   # FR_PRIVATE
+        elif sys.platform == "darwin":
+            # CoreText: register each file for this process only.
+            ct = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreText.framework/CoreText")
+            cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+            cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+            ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+            ct.CTFontManagerRegisterFontsForURL.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            for path in paths:
+                raw = path.encode("utf-8")
+                url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+                if url:
+                    ct.CTFontManagerRegisterFontsForURL(url, 1, None)        # kCTFontManagerScopeProcess
+                    cf.CFRelease(url)
+    except Exception:
+        pass  # the app falls back to standard fonts
 
 
 class Fonts:
-    """Font tuples, falling back to Windows fonts if the bundled ones are missing."""
+    """Font tuples, falling back to standard fonts if the bundled ones are missing."""
     def __init__(self, root):
         fams = set(tkfont.families(root))
-        self.head_family = "Caprasimo" if "Caprasimo" in fams else "Georgia"
-        self.body_family = "Figtree" if "Figtree" in fams else "Segoe UI"
-        self.semi_family = "Figtree SemiBold" if "Figtree SemiBold" in fams else "Segoe UI Semibold"
+
+        def pick(*names):
+            return next((n for n in names if n in fams), names[-1])
+        self.head_family = pick("Caprasimo", "Georgia")
+        self.body_family = pick("Figtree", "Segoe UI", "Helvetica Neue", "Helvetica")
+        # Windows lists "Figtree SemiBold" as its own family; macOS only lists "Figtree",
+        # so there the semibold voice is Figtree in bold.
+        self.semi_family = pick("Figtree SemiBold", "Segoe UI Semibold", self.body_family)
+        self.semi_weight = "normal" if self.semi_family in ("Figtree SemiBold", "Segoe UI Semibold") else "bold"
 
     def head(self, size):
         return ctk.CTkFont(family=self.head_family, size=size)
@@ -119,7 +145,7 @@ class Fonts:
         return ctk.CTkFont(family=self.body_family, size=size)
 
     def semi(self, size):
-        return ctk.CTkFont(family=self.semi_family, size=size)
+        return ctk.CTkFont(family=self.semi_family, size=size, weight=self.semi_weight)
 
 
 def badge_image(n, px=52):
@@ -142,8 +168,9 @@ class StitcherApp(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=C["bg"])
         self.title(APP_TITLE)
-        self.geometry("1600x940")
-        self.minsize(1280, 760)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1600, sw - 40)}x{min(940, sh - 90)}+20+20")   # fits a laptop screen
+        self.minsize(1100, 680)
         self.F = Fonts(self)
 
         self.settings = core.load_settings()
@@ -520,12 +547,21 @@ class StitcherApp(ctk.CTk):
             self.scan()
 
     def browse_fiji(self):
-        f = filedialog.askopenfilename(
-            title="Choose the Fiji program (e.g. fiji-windows-x64.exe or ImageJ-win64.exe)",
-            filetypes=[("Programs", "*.exe"), ("All files", "*.*")])
-        if f:
-            self.fiji.set(os.path.normpath(f))
-            self._on_engine()
+        if sys.platform.startswith("win"):
+            f = filedialog.askopenfilename(
+                title="Choose the Fiji program (fiji-windows-x64.exe or ImageJ-win64.exe in the Fiji folder)",
+                filetypes=[("Programs", "*.exe"), ("All files", "*.*")])
+        else:  # macOS / Linux: pick Fiji.app or the Fiji folder
+            f = filedialog.askdirectory(title="Choose Fiji.app (or the Fiji folder)")
+        if not f:
+            return
+        exe = core.resolve_fiji(os.path.normpath(f))
+        if not exe:
+            messagebox.showwarning(APP_TITLE, "That doesn't look like Fiji. Choose the Fiji program, "
+                                              "Fiji.app, or the folder Fiji was unzipped into.")
+            return
+        self.fiji.set(exe)
+        self._on_engine()
 
     def _text_window(self, title, text, width=720, height=760):
         win = ctk.CTkToplevel(self, fg_color=C["bg"])
@@ -1022,7 +1058,7 @@ class StitcherApp(ctk.CTk):
                                            "Untick \"Skip already stitched\" to redo them.")
             return
         engine = self.engine.get()
-        if engine == "imagej" and not os.path.isfile(self.fiji.get()):
+        if engine == "imagej" and not core.resolve_fiji(self.fiji.get()):
             found = core.find_fiji()
             if found:
                 self.fiji.set(found)

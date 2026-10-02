@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -252,24 +253,69 @@ def write_tile_configuration(sample, folder, overlap):
 # --------------------------------------------------------------------------- #
 #  ImageJ / Fiji engine
 # --------------------------------------------------------------------------- #
-FIJI_EXE_NAMES = ("fiji-windows-x64.exe", "ImageJ-win64.exe", "fiji-windows-arm64.exe",
-                  "fiji-linux-x64", "ImageJ-linux64", "fiji-macos", "ImageJ-macosx")
+def _fiji_launcher_score(name):
+    """How well a file name matches this computer's Fiji launcher (0 = not a launcher)."""
+    import platform
+    low = name.lower()
+    if not low.startswith(("fiji-", "imagej-")) or low.endswith((".sh", ".txt", ".cfg", ".toml", ".bat")):
+        return 0
+    if sys.platform.startswith("win"):
+        plat_ok = low.endswith(".exe")
+    elif sys.platform == "darwin":
+        plat_ok = "macos" in low
+    else:
+        plat_ok = "linux" in low
+    if not plat_ok:
+        return 0
+    arm = platform.machine().lower() in ("arm64", "aarch64")
+    score = 2
+    if ("arm64" in low) == arm or "universal" in low:
+        score += 1                         # matching CPU type
+    if low.startswith("fiji-"):
+        score += 1                         # new launcher preferred over the old ImageJ-* one
+    return score
+
+
+def resolve_fiji(path):
+    """Turn whatever the user picked (the launcher itself, the Fiji folder, or the
+    macOS Fiji.app bundle) into the launcher program's path. Returns '' if none."""
+    if not path:
+        return ""
+    if os.path.isfile(path):
+        return path if _fiji_launcher_score(os.path.basename(path)) else ""
+    best, best_score = "", 0
+    for d in (path, os.path.join(path, "Fiji"), os.path.join(path, "Fiji.app"),
+              os.path.join(path, "Contents", "MacOS"),
+              os.path.join(path, "Fiji.app", "Contents", "MacOS"),
+              os.path.join(path, "Fiji", "Contents", "MacOS")):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            full = os.path.join(d, name)
+            score = _fiji_launcher_score(name)
+            if not score and d.endswith(os.path.join("Contents", "MacOS")) and os.access(full, os.X_OK):
+                score = 1                  # inside a macOS .app: any program is the launcher
+            if score > best_score and os.path.isfile(full):
+                best, best_score = full, score
+    return best
 
 
 def find_fiji():
-    """Best-effort search for a Fiji executable. Returns a path or ''."""
+    """Best-effort search for a Fiji launcher (Windows, macOS or Linux). Returns a path or ''."""
     home = os.path.expanduser("~")
     roots = [home, os.path.join(home, "Desktop"), os.path.join(home, "Downloads"),
              os.path.join(home, "OneDrive", "Desktop"), os.path.join(home, "Documents"),
-             "C:\\", "C:\\Program Files", "C:\\Program Files (x86)", "/Applications", "/opt"]
+             os.path.join(home, "Applications"), "/Applications", "/opt",
+             "C:\\", "C:\\Program Files", "C:\\Program Files (x86)"]
     for root in roots:
         for pattern in ("Fiji*", "fiji*", "*/Fiji*", "*/fiji*"):
             for d in glob.glob(os.path.join(root, pattern)):
-                for exe in FIJI_EXE_NAMES:
-                    for cand in (os.path.join(d, exe), os.path.join(d, "Fiji", exe),
-                                 os.path.join(d, "Contents", "MacOS", exe)):
-                        if os.path.isfile(cand):
-                            return cand
+                if os.path.isdir(d):
+                    exe = resolve_fiji(d)
+                    if exe:
+                        return exe
     return ""
 
 
@@ -333,7 +379,8 @@ def run_imagej(samples, folder, fiji_path, overlap=0.20, refine=True,
     sample, that sample is marked failed and Fiji is restarted for the rest, so
     one bad sample doesn't stop the whole batch.
     on_start(sample_name) / on_done(sample_name, ok: bool) are called around each sample."""
-    if not fiji_path or not os.path.isfile(fiji_path):
+    fiji_path = resolve_fiji(fiji_path)
+    if not fiji_path:
         raise FileNotFoundError('Fiji was not found. Click "Find..." next to "Fiji program" and choose it.')
     os.makedirs(os.path.join(folder, OUT_DIR_NAME), exist_ok=True)
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0

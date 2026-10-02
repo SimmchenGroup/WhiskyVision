@@ -10,14 +10,35 @@ No coding is needed.
 
 ## One-time setup
 
+Download this folder (on GitHub: **Code → Download ZIP**) and **unzip it** somewhere, for
+example your Desktop. Keep all the files together; the launcher needs the files next to it.
+
+**Windows**
+
 1. **Install Python** from <https://www.python.org/downloads/>.
    On the first installer screen, tick **"Add python.exe to PATH"**.
 2. **Install Fiji** from <https://fiji.sc>, unzip it somewhere (for example your Desktop), and
    open it once so it can finish setting up. *(You can skip this if you only use the "Python" engine, see below.)*
 
+**Mac**
+
+1. **Install Python** from <https://www.python.org/downloads/macos/> (the standard installer).
+   Don't rely on the `python3` that comes with macOS; it can't show windows properly.
+2. **Install Fiji** from <https://fiji.sc>: drag `Fiji.app` into *Applications*, then open it once
+   by **right-clicking it → Open → Open**. That tells macOS it's safe. *(Skip this if you only use the "Python" engine.)*
+
+You need an internet connection the first time you start the stitcher. It downloads about
+100 MB of add-ons once, and after that it works offline.
+
 ## Every time
 
-1. Double-click **`Start Stitcher.bat`**.
+1. Start the stitcher:
+   - **Windows:** double-click **`Start Stitcher.bat`**.
+   - **Mac:** double-click **`Start Stitcher.command`**. The first time, macOS may say it
+     "cannot be opened". If so, **right-click it → Open → Open**, or on newer macOS go to
+     *System Settings → Privacy & Security* and click **Open Anyway**. A Terminal window opens
+     alongside the stitcher, and you can close it once the stitcher appears.
+
    The first time, it installs a few extra parts automatically (about a minute).
 2. Click **Browse…** and pick the folder that holds your tiles.
 3. Every sample in the folder is listed under **Samples**. **Click one** to see it side by side:
@@ -91,7 +112,9 @@ the other is detected automatically.
 | A sample shows *Redo* | Its old result file is broken. Press Stitch to make it again. |
 | Stitched image is scrambled | Wrong order or rows/cols. Change them until the After quick preview looks right. |
 | Tiles slightly misaligned | Set **Overlap** closer to the real overlap, or try the other engine. |
-| "Fiji wasn't found" | Click **Change** next to Fiji and choose `fiji-windows-x64.exe` (or `ImageJ-win64.exe`) inside the Fiji folder. |
+| Mac: "Start Stitcher.command" does nothing / "permission denied" | Open *Terminal*, type `chmod +x ` (with a space), drag the file into the window, and press Return. Then double-click it again. |
+| Mac: macOS asks whether Fiji may access Desktop/Documents/Downloads | Click **Allow**. Fiji needs to read your tiles and save the results. |
+| "Fiji wasn't found" | Click **Change** next to Fiji and choose `fiji-windows-x64.exe` (or `ImageJ-win64.exe`) inside the Fiji folder. On a Mac, choose `Fiji.app`. |
 | *Failed* | Click **Show log** for the reason. One failed sample doesn't stop the others. |
 
 ---
@@ -100,8 +123,9 @@ the other is detected automatically.
 
 | File | Purpose |
 |---|---|
+| `Start Stitcher.bat` / `Start Stitcher.command` | Windows / macOS launchers. The Windows one installs packages with `pip --user`. The Mac one makes a private `.venv` inside the folder, because Homebrew/macOS Python refuse user installs. |
 | `stitch_gui.py` | The window (CustomTkinter). Layout "1c Before / after" from the Claude Design mockups, in the Organic style. |
-| `fonts/` | Caprasimo and Figtree (SIL Open Font License, see the `OFL-*.txt` files). They're loaded privately when the app starts, so nothing is installed on the computer. |
+| `fonts/` | Caprasimo and Figtree (SIL Open Font License, see the `OFL-*.txt` files). They're loaded privately when the app starts (GDI on Windows, CoreText on macOS), so nothing is installed on the computer. |
 | `stitcher_core.py` | Scanning and grouping files, grid layout, ImageJ macro generation, and running Fiji headless. |
 | `stitch_native.py` | Pure-Python engine. Can also be used from the command line: `python stitch_native.py <folder> [--rows R --cols C --order "Row by row"]` |
 | `legacy/` | The earlier scripts (`prepare.py`, `stitch.py`, `rename.py`), which generated a macro to run by hand in Fiji. |
