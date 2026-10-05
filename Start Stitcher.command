@@ -30,7 +30,7 @@ fi
 # First run: a private Python environment inside this folder, so nothing is
 # installed system-wide. Later runs reuse it.
 VENV=".venv"
-if ! "$VENV/bin/python" -c "import numpy, PIL, tifffile, imagecodecs, customtkinter" >/dev/null 2>&1; then
+if ! "$VENV/bin/python" -c "import numpy, PIL, tifffile, imagecodecs, customtkinter, cv2, openpyxl" >/dev/null 2>&1; then
     echo "First run: installing the parts the stitcher needs. This only happens once..."
     "$PY" -m venv "$VENV" || { echo "Couldn't set up Python here."; pause_and_exit; }
     "$VENV/bin/python" -m pip install --upgrade pip >/dev/null 2>&1

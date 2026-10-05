@@ -103,6 +103,34 @@ the other is detected automatically.
 - **Fine-tune positions**: leave this on. Turn it off only if the stitcher keeps
   misplacing tiles of a featureless sample. It will then use exactly the overlap you entered.
 
+## Identify tab: which whisky made this web?
+
+Switch to **Identify** at the top of the window to test how similar a web is to webs of known
+whiskies. It uses the method from Khalifa Mohamed's *Whisky Web Identification* script: every
+image is turned grey, shrunk to 128 × 128, described by its HOG features (edge directions), and
+compared with every reference image by cosine similarity. The closest reference wins.
+
+1. **Reference images:** click **Browse…** and pick a folder with one sub-folder per whisky:
+
+   ```
+   Learning_Database/
+       A/   image1.tif  image2.tif …
+       B/   …
+   Whisky_Key.xlsx      (optional: column 1 = folder name, column 2 = whisky name)
+   ```
+
+   A spreadsheet with "key" in its name, in or next to that folder, is picked up automatically
+   (first row = headings). Without one, the folder names are shown, so you can also just name
+   the folders after the whiskies. **Check database** matches every reference image against all
+   the others and shows how often each whisky is recognised.
+2. **Test images:** **Add folder** (for example the `Stitched` folder) or **Add files**.
+3. Press **Identify N images**. Click an image to see it next to its closest reference, with the
+   best score for each whisky (1.000 = identical).
+
+If a test image's name starts with the class code and `_` (`O_4.tif` is class `O`), or it's in a
+folder named after the class, the **Result** column shows ✓ or ✗ and the overall percentage.
+**Save results (CSV)** writes everything to a spreadsheet.
+
 ## Troubleshooting
 
 | Problem | What to do |
@@ -127,6 +155,8 @@ the other is detected automatically.
 | `stitch_gui.py` | The window (CustomTkinter). Layout "1c Before / after" from the Claude Design mockups, in the Organic style. |
 | `fonts/` | Caprasimo and Figtree (SIL Open Font License, see the `OFL-*.txt` files). They're loaded privately when the app starts (GDI on Windows, CoreText on macOS), so nothing is installed on the computer. |
 | `stitcher_core.py` | Scanning and grouping files, grid layout, ImageJ macro generation, and running Fiji headless. |
+| `identify_gui.py` | The Identify tab, built the first time it's opened. |
+| `identify_core.py` | HOG + cosine-similarity matching, adapted from *Whisky Web Identification.py*. It shows the whisky of the **matched** reference (the original script looked up the test file's own prefix, so it printed the expected answer). scikit-learn/pandas are replaced by the equivalent numpy/openpyxl code, and the scores are identical. Command line: `python identify_core.py <reference folder> <test images or folder> [--key Whisky_Key.xlsx]` |
 | `stitch_native.py` | Pure-Python engine. Can also be used from the command line: `python stitch_native.py <folder> [--rows R --cols C --order "Row by row"]` |
 | `legacy/` | The earlier scripts (`prepare.py`, `stitch.py`, `rename.py`), which generated a macro to run by hand in Fiji. |
 

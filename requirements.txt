@@ -3,3 +3,5 @@ Pillow
 tifffile
 imagecodecs
 customtkinter
+opencv-python-headless
+openpyxl

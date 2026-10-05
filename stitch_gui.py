@@ -9,6 +9,8 @@ Double-click "Start Stitcher.bat" (or run `python stitch_gui.py`), then:
   4. press "Stitch"
 Results are written to <folder>/Stitched/<sample>_stitched.tif.
 
+The "Identify" tab (identify_gui.py) matches images against reference whiskies.
+
 Look: the "Organic" design (cream + terracotta, Caprasimo / Figtree), layout 1c
 "Before | after" from the Claude Design mockups. Built on CustomTkinter.
 """
@@ -193,6 +195,8 @@ class StitcherApp(ctk.CTk):
         self._drag = None
         self._redraw_job = None
         self.list_expanded = True
+        self.page = tk.StringVar(value="Stitch")
+        self.identify = None        # IdentifyTab, made the first time it's opened
 
         s = self.settings
         self.folder = tk.StringVar(value=s.get("folder", ""))
@@ -238,7 +242,7 @@ class StitcherApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         self._build_header()
-        body = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
+        self.stitch_body = body = ctk.CTkFrame(self, fg_color=C["bg"], corner_radius=0)
         body.grid(row=1, column=0, sticky="nsew", padx=28, pady=20)
         body.grid_rowconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=1)
@@ -250,11 +254,17 @@ class StitcherApp(ctk.CTk):
     def _build_header(self):
         bar = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=0, height=78)
         bar.grid(row=0, column=0, sticky="ew")
-        bar.grid_columnconfigure(1, weight=1, minsize=500)
+        bar.grid_columnconfigure(2, weight=1, minsize=500)
         ctk.CTkLabel(bar, text=APP_TITLE, font=self.F.head(22), text_color=C["text"]).grid(
-            row=0, column=0, padx=(28, 24), pady=18)
-        pill = ctk.CTkFrame(bar, fg_color=C["bg"], corner_radius=21, height=42)
-        pill.grid(row=0, column=1, sticky="ew")
+            row=0, column=0, padx=(28, 18), pady=18)
+        ctk.CTkSegmentedButton(bar, values=["Stitch", "Identify"], variable=self.page,
+                               command=self.show_page, font=self.F.semi(14), height=36,
+                               corner_radius=18, fg_color=C["bg"], selected_color=C["accent"],
+                               selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
+                               unselected_hover_color=C["hover_tint"], text_color=C["text"]).grid(
+            row=0, column=1, padx=(0, 20))
+        self.folder_pill = pill = ctk.CTkFrame(bar, fg_color=C["bg"], corner_radius=21, height=42)
+        pill.grid(row=0, column=2, sticky="ew")
         pill.grid_columnconfigure(1, weight=1)
         self._badge(pill, 1, 30).grid(row=0, column=0, padx=(6, 8), pady=6)
         ctk.CTkEntry(pill, textvariable=self.folder, border_width=0, fg_color=C["bg"],
@@ -263,9 +273,10 @@ class StitcherApp(ctk.CTk):
         ctk.CTkButton(pill, text="Browse…", command=self.browse, height=32, width=96, corner_radius=16,
                       fg_color=C["text"], hover_color=C["soft"], text_color=C["bg"],
                       font=self.F.head(13)).grid(row=0, column=2, padx=6)
-        self._link(bar, "Rescan", self.scan, 14).grid(row=0, column=2, padx=(14, 0))
-        bar.grid_columnconfigure(3, weight=1)
-        self._link(bar, "Help", self.show_help, 14).grid(row=0, column=4, padx=(0, 22))
+        self.rescan_link = self._link(bar, "Rescan", self.scan, 14)
+        self.rescan_link.grid(row=0, column=3, padx=(14, 0))
+        bar.grid_columnconfigure(4, weight=1)
+        self._link(bar, "Help", self.show_help, 14).grid(row=0, column=5, padx=(0, 22))
 
     def _build_left(self, body):
         self.left = ctk.CTkFrame(body, fg_color=C["bg"], corner_radius=0, width=540)
@@ -497,7 +508,7 @@ class StitcherApp(ctk.CTk):
             cv.bind("<Double-Button-1>", lambda e: self.zoom_fit())
 
     def _build_runbar(self):
-        bar = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=0)
+        self.stitch_runbar = bar = ctk.CTkFrame(self, fg_color=C["surface"], corner_radius=0)
         bar.grid(row=2, column=0, sticky="ew")
         bar.grid_columnconfigure(2, weight=1)
         self.run_btn = ctk.CTkButton(bar, text="Stitch", image=badge_image(4), compound="left",
@@ -538,6 +549,22 @@ class StitcherApp(ctk.CTk):
                      borderwidth=0, relief="flat", font=(self.F.semi_family, 8), padding=(4, 6))
         st.map("WW.Treeview.Heading", background=[("active", C["surface"])])
 
+    def show_page(self, name):
+        """Switch between the Stitch and Identify tabs."""
+        if name == "Identify" and self.identify is None:
+            try:
+                from identify_gui import IdentifyTab
+                self.identify = IdentifyTab(self, C, badge_image)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, f"The Identify tab couldn't start:\n{e}")
+                self.page.set("Stitch")
+                return
+        stitch = name == "Stitch"
+        for w in (self.stitch_body, self.stitch_runbar, self.folder_pill, self.rescan_link):
+            w.grid() if stitch else w.grid_remove()
+        if self.identify is not None:
+            self.identify.hide() if stitch else self.identify.show()
+
     # ================================================================= actions
     def browse(self):
         d = filedialog.askdirectory(title="Choose the folder with your tiles",
@@ -576,7 +603,11 @@ class StitcherApp(ctk.CTk):
         return box
 
     def show_help(self):
-        self._text_window("How to use", HELP_TEXT)
+        if self.page.get() == "Identify":
+            from identify_gui import HELP_TEXT as ID_HELP
+            self._text_window("How to identify", ID_HELP)
+        else:
+            self._text_window("How to use", HELP_TEXT)
 
     def show_log(self):
         box = self._text_window("Log", "\n".join(self.logs) or "Nothing yet.", 820, 520)
@@ -1038,6 +1069,8 @@ class StitcherApp(ctk.CTk):
         self.settings.update(folder=self.folder.get(), engine=self.engine.get(), fiji=self.fiji.get(),
                              overlap=int(self.overlap.get()), refine=bool(self.refine.get()),
                              skip_done=bool(self.skip_done.get()))
+        if self.identify is not None:
+            self.settings.update(self.identify.settings())
         core.save_settings(self.settings)
 
     def start(self):
@@ -1143,6 +1176,8 @@ class StitcherApp(ctk.CTk):
                              f"\"{core.OUT_DIR_NAME}\" folder.")
                 elif kind == "redraw":
                     self._draw_previews()
+                elif kind.startswith("id_") and self.identify is not None:
+                    self.identify.handle(kind, data)
                 elif kind == "quick":
                     key, result = data
                     self.quick_pending.discard(key)
@@ -1159,6 +1194,10 @@ class StitcherApp(ctk.CTk):
             if not messagebox.askyesno(APP_TITLE, "Stitching is still running. Stop and quit?"):
                 return
             self.stop_flag.set()
+        if self.identify is not None and self.identify.busy():
+            if not messagebox.askyesno(APP_TITLE, "Identifying is still running. Stop and quit?"):
+                return
+            self.identify.stop_flag.set()
         self._save_settings()
         self.destroy()
 
