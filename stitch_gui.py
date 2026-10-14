@@ -9,7 +9,8 @@ Double-click "Start Stitcher.bat" (or run `python stitch_gui.py`), then:
   4. press "Stitch"
 Results are written to <folder>/Stitched/<sample>_stitched.tif.
 
-The "Identify" tab (identify_gui.py) matches images against reference whiskies.
+The "Identify" tab (identify_gui.py) matches images against reference whiskies;
+the "Gallery" tab (gallery_gui.py) shows thumbnails of the stitched reference images.
 
 Look: the "Organic" design (cream + terracotta, Caprasimo / Figtree), layout 1c
 "Before | after" from the Claude Design mockups. Built on CustomTkinter.
@@ -179,6 +180,7 @@ class StitcherApp(ctk.CTk):
         self.samples = {}           # name -> core.Sample
         self.selected = {}          # name -> bool (stitch this one?)
         self.status = {}            # name -> (text, tag) while/after stitching
+        self.redo = set()           # samples to stitch again even if a result exists
         self.thumbs = {}            # path -> PIL thumbnail (None if unreadable)
         self.thumb_errors = {}      # path -> why it couldn't be opened
         self.loading = set()        # paths being decoded in the background
@@ -197,6 +199,7 @@ class StitcherApp(ctk.CTk):
         self.list_expanded = True
         self.page = tk.StringVar(value="Stitch")
         self.identify = None        # IdentifyTab, made the first time it's opened
+        self.gallery = None         # GalleryTab, likewise (it shares Identify's folder)
 
         s = self.settings
         self.folder = tk.StringVar(value=s.get("folder", ""))
@@ -257,7 +260,7 @@ class StitcherApp(ctk.CTk):
         bar.grid_columnconfigure(2, weight=1, minsize=500)
         ctk.CTkLabel(bar, text=APP_TITLE, font=self.F.head(22), text_color=C["text"]).grid(
             row=0, column=0, padx=(28, 18), pady=18)
-        ctk.CTkSegmentedButton(bar, values=["Stitch", "Identify"], variable=self.page,
+        ctk.CTkSegmentedButton(bar, values=["Stitch", "Identify", "Gallery"], variable=self.page,
                                command=self.show_page, font=self.F.semi(14), height=36,
                                corner_radius=18, fg_color=C["bg"], selected_color=C["accent"],
                                selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
@@ -550,20 +553,47 @@ class StitcherApp(ctk.CTk):
         st.map("WW.Treeview.Heading", background=[("active", C["surface"])])
 
     def show_page(self, name):
-        """Switch between the Stitch and Identify tabs."""
-        if name == "Identify" and self.identify is None:
-            try:
+        """Switch between the Stitch, Identify and Gallery tabs."""
+        try:
+            if name in ("Identify", "Gallery") and self.identify is None:
                 from identify_gui import IdentifyTab
                 self.identify = IdentifyTab(self, C, badge_image)
-            except Exception as e:
-                messagebox.showerror(APP_TITLE, f"The Identify tab couldn't start:\n{e}")
-                self.page.set("Stitch")
-                return
+            if name == "Gallery" and self.gallery is None:
+                from gallery_gui import GalleryTab
+                self.gallery = GalleryTab(self, C, self.identify)
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"The {name} tab couldn't start:\n{e}")
+            self.page.set("Stitch")
+            name = "Stitch"
         stitch = name == "Stitch"
         for w in (self.stitch_body, self.stitch_runbar, self.folder_pill, self.rescan_link):
             w.grid() if stitch else w.grid_remove()
-        if self.identify is not None:
-            self.identify.hide() if stitch else self.identify.show()
+        for tab, tab_name in ((self.identify, "Identify"), (self.gallery, "Gallery")):
+            if tab is not None:
+                tab.show() if name == tab_name else tab.hide()
+
+    def mark_redo(self, folder, name):
+        """Queue one sample to be stitched again (used by the Gallery's remove button).
+        Opens its tile folder on the Stitch tab if another one is open. False while stitching."""
+        if self.worker and self.worker.is_alive():
+            return False
+        same = os.path.normcase(os.path.normpath(folder)) == \
+            os.path.normcase(os.path.normpath(self.folder.get() or "."))
+        if not same or name not in self.samples:
+            self.folder.set(os.path.normpath(folder))
+            self.scan()
+        if name not in self.samples:
+            return False
+        self.redo.add(name)
+        self.selected[name] = True
+        self.status.pop(name, None)
+        out = self.samples[name].output_path(self.folder.get())
+        self.thumbs.pop(out, None)
+        self._refresh_table()
+        self.tree.selection_set(name)
+        self.tree.see(name)
+        self.log(f"{name}: marked Redo")
+        return True
 
     # ================================================================= actions
     def browse(self):
@@ -603,7 +633,10 @@ class StitcherApp(ctk.CTk):
         return box
 
     def show_help(self):
-        if self.page.get() == "Identify":
+        if self.page.get() == "Gallery":
+            from gallery_gui import HELP_TEXT as GALLERY_HELP
+            self._text_window("Gallery", GALLERY_HELP, 640, 440)
+        elif self.page.get() == "Identify":
             from identify_gui import HELP_TEXT as ID_HELP
             self._text_window("How to identify", ID_HELP)
         else:
@@ -626,6 +659,7 @@ class StitcherApp(ctk.CTk):
         self.samples = {s.name: s for s in samples}
         self.selected = {s.name: True for s in samples}
         self.status = {}
+        self.redo = set()
         self.thumbs.clear()
         self.thumb_errors.clear()
         self.quick_cache.clear()
@@ -736,6 +770,8 @@ class StitcherApp(ctk.CTk):
         p = s.problem()
         if p:
             return "Fix layout", "bad"
+        if s.name in self.redo:
+            return "Redo", "redo"
         out = s.output_path(self.folder.get())
         if self.skip_done.get() and self._done_cached(out):
             return "Stitched", "done"
@@ -749,7 +785,8 @@ class StitcherApp(ctk.CTk):
         folder = self.folder.get()
         return [s for name, s in self.samples.items()
                 if self.selected[name] and not s.problem()
-                and not (self.skip_done.get() and self._done_cached(s.output_path(folder)))]
+                and not (self.skip_done.get() and name not in self.redo
+                         and self._done_cached(s.output_path(folder)))]
 
     def _refresh_table(self):
         sel = self.tree.selection()
@@ -1069,8 +1106,9 @@ class StitcherApp(ctk.CTk):
         self.settings.update(folder=self.folder.get(), engine=self.engine.get(), fiji=self.fiji.get(),
                              overlap=int(self.overlap.get()), refine=bool(self.refine.get()),
                              skip_done=bool(self.skip_done.get()))
-        if self.identify is not None:
-            self.settings.update(self.identify.settings())
+        for tab in (self.identify, self.gallery):
+            if tab is not None:
+                self.settings.update(tab.settings())
         core.save_settings(self.settings)
 
     def start(self):
@@ -1153,9 +1191,14 @@ class StitcherApp(ctk.CTk):
                     if name in self.samples:
                         self.status[name] = st
                         self._refresh_table()
+                        if st[1] == "run":           # follow along: show the sample being stitched
+                            self.tree.selection_set(name)
+                            self.tree.see(name)
                 elif kind == "done":
                     name, ok = data
                     self.status[name] = ("Done", "done") if ok else ("Failed", "bad")
+                    if ok:
+                        self.redo.discard(name)
                     self.finished += 1
                     self.progress.set(self.finished / max(1, self.total))
                     self.run_btn.configure(text=f"Stitching {self.finished} / {self.total}")
@@ -1178,6 +1221,8 @@ class StitcherApp(ctk.CTk):
                     self._draw_previews()
                 elif kind.startswith("id_") and self.identify is not None:
                     self.identify.handle(kind, data)
+                elif kind.startswith("gal_") and self.gallery is not None:
+                    self.gallery.handle(kind, data)
                 elif kind == "quick":
                     key, result = data
                     self.quick_pending.discard(key)

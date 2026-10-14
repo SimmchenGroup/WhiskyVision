@@ -20,7 +20,7 @@ import identify_core as idc
 import stitcher_core as core
 
 THUMB = 1000
-TOP_N = 5
+RANK_H = 176          # height of the scrolling "best score for each whisky" list (px)
 
 HELP_TEXT = """\
 IDENTIFY: WHICH WHISKY MADE THIS WEB?
@@ -31,6 +31,15 @@ IDENTIFY: WHICH WHISKY MADE THIS WEB?
        Learning_Database/
            A/   image1.tif  image2.tif …
            B/   …
+
+   Only stitched images are used: files named "…_stitched" or kept in a
+   "Stitched" folder (raw tiles are never compared). A whisky folder
+   that has no stitched images yet is left out and listed as "not
+   stitched yet". (If no folder has stitched images at all, every image
+   is used, as in the original Learning_Database.) The first run reads
+   every reference image, which is
+   slow over the network; their features are then saved on this
+   computer, so later runs start in seconds.
 
    A whisky key spreadsheet (column 1 = folder name, column 2 = whisky
    name, first row = headings) is found automatically if its file name
@@ -45,7 +54,11 @@ IDENTIFY: WHICH WHISKY MADE THIS WEB?
 3. Press "Identify". Each image gets the whisky of its most similar
    reference image, with the cosine similarity (1.000 = identical).
    Click an image to see it next to that reference, and the best score
-   for each whisky.
+   for each whisky. Click a whisky in that list (or use ‹ › or the ← →
+   keys) to see the closest image from that whisky instead.
+
+   Whiskies are shown as letter · sample number and name from the key,
+   e.g. "M · #13  Glenlivet 25YO".
 
 RIGHT OR WRONG
 
@@ -72,6 +85,10 @@ class IdentifyTab:
         self.results = {}           # path -> idc.Match
         self.db_items = []          # [(label, path)] from the last scan
         self.names = {}             # class code -> whisky name
+        self.ids = {}               # class code -> (letter, sample number) from the key
+        self.rank_rows = []         # widgets of the "best score for each whisky" list
+        self.rank_sel = 0           # which whisky of the ranking the right-hand picture shows
+        self.rank_for = None        # (image path, match) the ranking was drawn for
         self.key_note = ""
         self.thumbs, self.loading = {}, set()
         self.photos = []
@@ -163,7 +180,7 @@ class IdentifyTab:
         self.tree = ttk.Treeview(holder, columns=cols, show="headings", selectmode="browse",
                                  style="WW.Treeview")
         for col, text, w, anchor, stretch in (
-                ("image", "IMAGE", 150, "w", True), ("match", "CLOSEST WHISKY", 150, "w", True),
+                ("image", "IMAGE", 120, "w", True), ("match", "CLOSEST WHISKY", 190, "w", True),
                 ("score", "SIMILARITY", 90, "center", False), ("result", "RESULT", 70, "center", False)):
             self.tree.heading(col, text=text, anchor=anchor)
             self.tree.column(col, width=w, minwidth=60, anchor=anchor, stretch=stretch)
@@ -176,6 +193,8 @@ class IdentifyTab:
                             ("plain", C["text"])):
             self.tree.tag_configure(tag, foreground=colour)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._draw())
+        self.tree.bind("<Left>", lambda e: (self.step_rank(-1), "break")[1])
+        self.tree.bind("<Right>", lambda e: (self.step_rank(1), "break")[1])
 
         # -- previews
         right = ctk.CTkFrame(self.body, fg_color=C["bg"], corner_radius=0)
@@ -195,8 +214,25 @@ class IdentifyTab:
             w.grid(row=1, column=col, sticky="nsew", padx=(0, 8) if col == 0 else (8, 0))
             w.grid_rowconfigure(1, weight=1)
             w.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(w, text=title, font=F.head(17), text_color=C["bg"]).grid(
-                row=0, column=0, sticky="w", padx=24, pady=(18, 0))
+            top = ctk.CTkFrame(w, fg_color="transparent")
+            top.grid(row=0, column=0, sticky="ew", padx=(24, 16), pady=(14, 0))
+            top.grid_columnconfigure(0, weight=1)
+            label = ctk.CTkLabel(top, text=title, font=F.head(17), text_color=C["bg"], anchor="w")
+            label.grid(row=0, column=0, sticky="w", pady=4)
+            if col == 1:
+                self.ref_title = label
+                self.ref_steps = ctk.CTkFrame(top, fg_color=C["seg"], corner_radius=16)
+                self.ref_steps.grid(row=0, column=1)
+                for text, d in (("‹", -1), (None, 0), ("›", 1)):
+                    if text is None:
+                        self.ref_pos = ctk.CTkLabel(self.ref_steps, text="", width=58, font=F.semi(13),
+                                                    text_color=C["bg"])
+                        self.ref_pos.pack(side="left")
+                    else:
+                        ctk.CTkButton(self.ref_steps, text=text, width=30, height=30, corner_radius=15,
+                                      fg_color=C["seg"], hover_color=C["soft"], text_color=C["bg"],
+                                      font=F.semi(17), command=lambda d=d: self.step_rank(d)).pack(
+                            side="left", padx=2, pady=2)
             cv = tk.Canvas(w, background=C["well"], highlightthickness=0)
             cv.grid(row=1, column=0, sticky="nsew", padx=18, pady=8)
             cv.bind("<Configure>", lambda e: self._schedule_draw())
@@ -206,20 +242,17 @@ class IdentifyTab:
 
         rank = ctk.CTkFrame(right, fg_color=C["surface"], corner_radius=28)
         rank.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        rank.grid_columnconfigure(1, weight=1)
+        rank.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(rank, text="Best score for each whisky", font=F.semi(15), text_color=C["text"]).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=20, pady=(14, 4))
-        self.rank_rows = []
-        for i in range(TOP_N):
-            name = ctk.CTkLabel(rank, text="", font=F.body(13), text_color=C["text"], anchor="w", width=220)
-            name.grid(row=i + 1, column=0, sticky="w", padx=(20, 10), pady=2)
-            bar = ctk.CTkProgressBar(rank, height=8, corner_radius=4, fg_color=C["track"],
-                                     progress_color=C["accent"])
-            bar.grid(row=i + 1, column=1, sticky="ew")
-            score = ctk.CTkLabel(rank, text="", font=F.semi(13), text_color=C["text"], width=60)
-            score.grid(row=i + 1, column=2, padx=(10, 20))
-            self.rank_rows.append((name, bar, score))
-        ctk.CTkFrame(rank, fg_color="transparent", height=10).grid(row=TOP_N + 1, column=0)
+            row=0, column=0, sticky="w", padx=20, pady=(14, 2))
+        ctk.CTkLabel(rank, text="Click one to see its closest image (or use ‹ › / the ← → keys)",
+                     font=F.body(12), text_color=C["muted"]).grid(row=0, column=1, sticky="e", padx=20,
+                                                                    pady=(14, 2))
+        self.rank_list = ctk.CTkScrollableFrame(rank, fg_color=C["surface"], corner_radius=0, height=RANK_H,
+                                                scrollbar_button_color=C["line"],
+                                                scrollbar_button_hover_color=C["muted"])
+        self.rank_list.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(10, 6), pady=(0, 12))
+        self.rank_list.grid_columnconfigure(0, weight=1)
 
         # -- run bar
         self.runbar = bar = ctk.CTkFrame(app, fg_color=C["surface"], corner_radius=0)
@@ -286,18 +319,21 @@ class IdentifyTab:
             self.db_info.configure(text="This folder doesn't exist")
         else:
             try:
-                self.db_items = idc.scan_database(folder)
+                found, unstitched = idc.scan_classes(folder)
             except OSError as e:
                 self.db_info.configure(text=f"Couldn't read the folder: {e}")
             else:
-                classes = sorted({lab for lab, _ in self.db_items})
+                self.db_items = [(lab, p) for lab, paths in found for p in paths]
+                classes = [lab for lab, _ in found]
                 if not classes:
-                    self.db_info.configure(text="No images in sub-folders – see Help for the layout")
+                    text = "No stitched images in sub-folders – see Help for the layout"
                 else:
-                    self.db_info.configure(
-                        text=f"{len(classes)} whisk{'y' if len(classes) == 1 else 'ies'} · "
-                             f"{len(self.db_items)} images ({', '.join(classes[:8])}"
-                             f"{', …' if len(classes) > 8 else ''})")
+                    text = (f"{len(classes)} whisk{'y' if len(classes) == 1 else 'ies'} · "
+                            f"{len(self.db_items)} reference images ({', '.join(classes[:8])}"
+                            f"{', …' if len(classes) > 8 else ''})")
+                if unstitched:
+                    text += f" · not stitched yet, left out: {', '.join(unstitched)}"
+                self.db_info.configure(text=text)
                 if not self.key_path.get():
                     found = idc.find_key(folder)
                     if found:
@@ -307,24 +343,26 @@ class IdentifyTab:
             self.log(f"Reference folder: {folder} ({len(self.db_items)} images)")
 
     def _classes(self):
-        return sorted({lab for lab, _ in self.db_items})
+        return sorted({lab for lab, _ in self.db_items}, key=idc.code_order)
 
     def _load_key(self):
         path = self.key_path.get()
-        self.names = {}
+        self.names, self.ids = {}, {}
         if not path or path == "-":
             self.key_info.configure(text="None – folder names are shown")
         elif not os.path.isfile(path):
             self.key_info.configure(text=f"{os.path.basename(path)} not found – folder names are shown")
         else:
             try:
-                self.names = idc.load_key(path, self._classes())
+                self.names, self.ids = idc.load_key_details(path, self._classes())
             except Exception as e:
                 self.key_info.configure(text=f"Couldn't read {os.path.basename(path)}: {e}")
             else:
                 classes = self._classes()
                 missing = [c for c in classes if c not in self.names]
-                text = f"{os.path.basename(path)} · {len(self.names)} names"
+                builtin = os.path.normcase(path) == os.path.normcase(idc.BUILTIN_KEY)
+                n = len(set(self.names.values()))
+                text = f"{os.path.basename(path)}{' (built in)' if builtin else ''} · {n} whiskies"
                 if classes and missing:
                     text += f" · no name for {', '.join(missing[:5])}{'…' if len(missing) > 5 else ''}"
                 self.key_info.configure(text=text)
@@ -347,6 +385,16 @@ class IdentifyTab:
 
     def whisky(self, label):
         return self.names.get(label, label)
+
+    def code(self, label):
+        """Letter and sample number, e.g. "M · #13" (just the folder name without a key)."""
+        letter, number = self.ids.get(label, (label, ""))
+        return " · ".join(x for x in (letter or label, f"#{number}" if number else "") if x)
+
+    def whisky_full(self, label):
+        """e.g. "M · #13  Glenlivet 25YO"."""
+        name = self.names.get(label)
+        return f"{self.code(label)}  {name}" if name else self.code(label)
 
     # ============================================================= test images
     def add_folder(self):
@@ -400,7 +448,7 @@ class IdentifyTab:
             else:
                 result = {True: "✓", False: "✗", None: "—"}[m.correct]
                 tag = {True: "ok", False: "bad", None: "plain"}[m.correct]
-                vals = (shown, self.whisky(m.label), f"{m.score:.3f}", result)
+                vals = (shown, self.whisky_full(m.label), f"{m.score:.3f}", result)
             self.tree.insert("", "end", iid=str(i), values=vals, tags=(tag,))
         keep = [n for n in sel if self.tree.exists(n)]
         if keep:
@@ -475,21 +523,14 @@ class IdentifyTab:
         self.photos.clear()
         path = self._current()
         m = self.results.get(path) if path else None
-        ranking = m.ranking[:TOP_N] if m and not m.error else []
-        for i, (name, bar, score) in enumerate(self.rank_rows):
-            if i < len(ranking):
-                lab, sc, _ = ranking[i]
-                extra = "   (expected)" if m.expected == lab and lab != m.label else ""
-                name.configure(text=self.whisky(lab) + extra,
-                               text_color=self.C["accent_deep"] if i == 0 else self.C["text"])
-                bar.set(max(0.0, min(1.0, sc)))
-                bar.configure(progress_color=self.C["accent"] if i == 0 else self.C["muted"])
-                score.configure(text=f"{sc:.3f}")
-                for w in (name, bar, score):
-                    w.grid()
-            else:
-                for w in (name, bar, score):
-                    w.grid_remove()
+        ranking = m.ranking if m and not m.error else []
+        if (path, m) != self.rank_for:          # another image or a new result: back to the best
+            self.rank_for, self.rank_sel = (path, m), 0
+            self.rank_list._parent_canvas.yview_moveto(0)
+        self.rank_sel = min(self.rank_sel, max(0, len(ranking) - 1))
+        self._draw_ranking(m, ranking)
+        self.ref_title.configure(text="Closest reference")
+        self.ref_steps.grid() if len(ranking) > 1 else self.ref_steps.grid_remove()
 
         if path is None:
             self.cur_title.configure(text="")
@@ -504,7 +545,10 @@ class IdentifyTab:
             self.cur_title.configure(text="")
             self.cur_summary.configure(text="Not identified yet")
             rnote.configure(text="")
-            self.app._message(rcv, "Press Identify")
+            self.app._message(rcv, "Working on it – see the progress bar below.\n\nThe first run reads every "
+                                   "reference image, which can take a while over the network. "
+                                   "After that they're remembered."
+                              if self.busy() else "Press Identify")
             return
         if m.error:
             self.cur_title.configure(text="")
@@ -513,17 +557,77 @@ class IdentifyTab:
             self.app._message(rcv, "Couldn't open this image:\n" + m.error, self.C["order"])
             return
         self.cur_title.configure(text=self.whisky(m.label))
-        summary = f"similarity {m.score:.3f}"
+        summary = f"{self.code(m.label)} · similarity {m.score:.3f}"
         if len(m.ranking) > 1:
-            summary += f" · next {self.whisky(m.ranking[1][0])} {m.ranking[1][1]:.3f}"
+            summary += f" · next {self.whisky_full(m.ranking[1][0])} {m.ranking[1][1]:.3f}"
         if m.correct is True:
             summary += " · ✓ matches the file name"
         elif m.correct is False:
-            summary += f" · ✗ expected {self.whisky(m.expected)}"
+            summary += f" · ✗ expected {self.whisky_full(m.expected)}"
         self.cur_summary.configure(text=summary)
-        rnote.configure(text=os.path.relpath(m.ref_path, self.db_folder.get())
-                        if self.db_folder.get() else os.path.basename(m.ref_path))
-        self._show_image(rcv, m.ref_path)
+        lab, sc, ref = ranking[self.rank_sel]
+        if self.rank_sel:
+            self.ref_title.configure(text=f"Closest {self.code(lab)} image")
+        self.ref_pos.configure(text=f"{self.rank_sel + 1} / {len(ranking)}")
+        where = os.path.relpath(ref, self.db_folder.get()) if self.db_folder.get() else os.path.basename(ref)
+        rnote.configure(text=f"{self.whisky_full(lab)} · {sc:.3f} · {where}")
+        self._show_image(rcv, ref)
+
+    def _draw_ranking(self, m, ranking):
+        """One row per whisky, best first; the selected one is highlighted."""
+        C, F = self.C, self.F
+        while len(self.rank_rows) < len(ranking):
+            i = len(self.rank_rows)
+            row = ctk.CTkFrame(self.rank_list, fg_color="transparent", corner_radius=14, height=30)
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+            row.grid_columnconfigure(2, weight=1)
+            pos = ctk.CTkLabel(row, text=f"{i + 1}", width=26, font=F.body(12), text_color=C["muted"])
+            pos.grid(row=0, column=0, padx=(8, 2))
+            name = ctk.CTkLabel(row, text="", font=F.body(13), anchor="w", width=290)
+            name.grid(row=0, column=1, sticky="w", padx=(0, 10))
+            bar = ctk.CTkProgressBar(row, height=8, corner_radius=4, fg_color=C["track"])
+            bar.grid(row=0, column=2, sticky="ew")
+            score = ctk.CTkLabel(row, text="", font=F.semi(13), width=60)
+            score.grid(row=0, column=3, padx=(10, 12))
+            for w in (row, pos, name, bar, score):
+                w.bind("<Button-1>", lambda e, i=i: self.pick_rank(i))
+                w.configure(cursor="hand2")
+            self.rank_rows.append((row, name, bar, score))
+        for i, (row, name, bar, score) in enumerate(self.rank_rows):
+            if i >= len(ranking):
+                row.grid_remove()
+                continue
+            lab, sc, _ = ranking[i]
+            extra = "   (expected)" if m.expected == lab and lab != m.label else ""
+            sel = i == self.rank_sel
+            row.configure(fg_color=C["accent_tint"] if sel else "transparent")
+            name.configure(text=self.whisky_full(lab) + extra,
+                           text_color=C["accent_ink"] if sel else (C["accent_deep"] if i == 0 else C["text"]))
+            bar.set(max(0.0, min(1.0, sc)))
+            bar.configure(progress_color=C["accent"] if i == 0 else C["muted"])
+            score.configure(text=f"{sc:.3f}", text_color=C["accent_ink"] if sel else C["text"])
+            row.grid()
+
+    def pick_rank(self, i):
+        """Show the closest image of the i-th best whisky."""
+        self.rank_sel = i
+        self._draw()
+
+    def step_rank(self, d):
+        path = self._current()
+        m = self.results.get(path) if path else None
+        if not m or m.error or len(m.ranking) < 2:
+            return
+        self.rank_sel = (self.rank_sel + d) % len(m.ranking)
+        self._draw()
+        n = len(m.ranking)            # keep the highlighted row in view
+        canvas = self.rank_list._parent_canvas
+        first, last = canvas.yview()
+        top, bottom = self.rank_sel / n, (self.rank_sel + 1) / n
+        if top < first:
+            canvas.yview_moveto(top)
+        elif bottom > last:
+            canvas.yview_moveto(bottom - (last - first))
 
     # ================================================================= running
     def _check_ready(self):
@@ -534,11 +638,9 @@ class IdentifyTab:
             messagebox.showinfo(self.app.title(), "Choose a reference folder with one sub-folder of "
                                                   "images per whisky first (see Help).")
             return False
-        try:
-            import cv2  # noqa: F401
-        except ImportError:
-            messagebox.showwarning(self.app.title(), "The image-matching part (OpenCV) isn't installed.\n\n"
-                                   "Run:  python -m pip install opencv-python-headless openpyxl")
+        problem = idc.opencv_problem()
+        if problem:
+            messagebox.showwarning(self.app.title(), problem)
             return False
         return True
 
@@ -557,9 +659,14 @@ class IdentifyTab:
         def work():
             try:
                 ev.put(("id_log", f"Reading {len(self.db_items)} reference images…"))
+
+                def progress(d, t):
+                    ev.put(("id_progress", 0.5 * d / t))
+                    if d % 20 == 0 or d == t:
+                        ev.put(("id_log", f"Reading reference images: {d} / {t} "
+                                          "(only slow the first time – they're remembered)"))
                 db = idc.build_database(folder, log=lambda msg: ev.put(("id_log", msg)),
-                                        progress=lambda d, t: ev.put(("id_progress", 0.5 * d / t)),
-                                        should_stop=self.stop_flag.is_set)
+                                        progress=progress, should_stop=self.stop_flag.is_set)
                 job(db)
             except InterruptedError:
                 ev.put(("id_log", "Stopped."))
@@ -624,8 +731,9 @@ class IdentifyTab:
             if m.error:
                 self.log(f"  {os.path.basename(m.path)}: couldn't open ({m.error})")
             else:
-                verdict = {True: " ✓", False: f" ✗ expected {self.whisky(m.expected)}", None: ""}[m.correct]
-                self.log(f"  {os.path.basename(m.path)}: {self.whisky(m.label)} "
+                verdict = {True: " ✓", False: f" ✗ expected {self.whisky_full(m.expected)}",
+                           None: ""}[m.correct]
+                self.log(f"  {os.path.basename(m.path)}: {self.whisky_full(m.label)} "
                          f"(similarity {m.score:.3f}){verdict}")
             self._refresh_table()
             if m.path == self._current():
@@ -653,16 +761,16 @@ class IdentifyTab:
                  "images. A whisky that is often mistaken for another needs more,",
                  "or more distinct, reference images.", "",
                  f"Overall: {ok} of {total} right ({100 * ok / max(1, total):.0f}%)", ""]
-        width = max(len(self.whisky(c)) for c in per_class) + 2
+        width = max(len(self.whisky_full(c)) for c in per_class) + 2
         for c in sorted(per_class):
             r, t = per_class[c]
-            lines.append(f"  {self.whisky(c):<{width}} {r:>3} / {t:<3} {100 * r / t:>4.0f}%"
+            lines.append(f"  {self.whisky_full(c):<{width}} {r:>3} / {t:<3} {100 * r / t:>4.0f}%"
                          + ("   (only one image – nothing to compare)" if t == 1 else ""))
         if misses:
             lines += ["", "MISTAKES", ""]
             for path, true, got, score in misses:
-                lines.append(f"  {os.path.relpath(path, db.folder)}: matched {self.whisky(got)} "
-                             f"({score:.3f}), is {self.whisky(true)}")
+                lines.append(f"  {os.path.relpath(path, db.folder)}: matched {self.whisky_full(got)} "
+                             f"({score:.3f}), is {self.whisky_full(true)}")
         if db.skipped:
             lines += ["", "COULDN'T OPEN", ""] + [f"  {os.path.relpath(p, db.folder)}: {e}" for p, e in db.skipped]
         self.log(f"Database check: {ok} of {total} reference images matched their own whisky")

@@ -3,5 +3,5 @@ Pillow
 tifffile
 imagecodecs
 customtkinter
-opencv-python-headless
+opencv-python-headless<5    # OpenCV 5 removed HOGDescriptor, which Identify needs
 openpyxl

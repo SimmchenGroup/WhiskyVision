@@ -360,7 +360,21 @@ def build_macro(samples, folder, layouts, refine, progress_file):
                 'computation_parameters=[Save computation time (but use more RAM)] '
                 'image_output=[Fuse and display]");')
         lines += [
-            'if (bitDepth() != 24) run("RGB Color");',
+            # Grid/Collection reads RGBA tiles (the microscope saves a 4th, all-255 channel
+            # that isn't marked as alpha) as 4 colour channels; merging that one in turns the
+            # whole result white. Keep channels 1-3 as red/green/blue at their full range.
+            'if (bitDepth() != 24) {',
+            '    getDimensions(ww_w, ww_h, ww_c, ww_z, ww_t);',
+            '    if (ww_c >= 3) {',
+            '        for (ww_k = ww_c; ww_k > 3; ww_k--) { Stack.setChannel(ww_k); '
+            'run("Delete Slice", "delete=channel"); }',
+            '        Stack.setDisplayMode("composite");',
+            '        Stack.setChannel(1); run("Red"); setMinAndMax(0, 255);',
+            '        Stack.setChannel(2); run("Green"); setMinAndMax(0, 255);',
+            '        Stack.setChannel(3); run("Blue"); setMinAndMax(0, 255);',
+            '    }',
+            '    run("RGB Color");',
+            '}',
             f'saveAs("Tiff", "{out_fwd}");',
             'close("*");',
             f'File.append("DONE|{name}", "{prog}");',

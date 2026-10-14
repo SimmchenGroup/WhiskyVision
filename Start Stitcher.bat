@@ -13,9 +13,9 @@ if not defined PY (
     exit /b 1
 )
 
-%PY% -c "import numpy, PIL, tifffile, imagecodecs, customtkinter, cv2, openpyxl" >nul 2>nul
+%PY% -c "import numpy, PIL, tifffile, imagecodecs, customtkinter, cv2, openpyxl; cv2.HOGDescriptor" >nul 2>nul
 if errorlevel 1 (
-    echo First run: installing the parts the stitcher needs. This only happens once...
+    echo Installing or updating the parts the stitcher needs. This only happens once...
     %PY% -m pip install --user -r requirements.txt
     if errorlevel 1 (
         echo.

@@ -28,7 +28,10 @@ Changes from the original script:
     non-ASCII paths), so the scores are the same but fewer packages are needed.
 """
 import csv
+import hashlib
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -37,13 +40,35 @@ import stitcher_core as core
 
 FEATURE_EDGE = 128
 KEY_EXTS = (".xlsx", ".xlsm", ".csv")
+BUILTIN_KEY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Whisky_Key.csv")
+
+FEATURE_DIR = os.path.join(os.path.expanduser("~"), ".whisky_stitcher_features")
+FEATURE_VERSION = "hog128-v1"   # change if extract_features changes, so old files aren't reused
+READERS = 6                     # images read at once (reading over the network is the slow part)
 
 _feature_cache = {}      # (path, mtime, size) -> feature vector
+_file_stats = {}         # path -> (mtime, size), noted while scanning: asking a network
+                         # drive for each file separately takes ~0.1 s per file
 
 
 # --------------------------------------------------------------------------- #
 #  Features
 # --------------------------------------------------------------------------- #
+def opencv_problem():
+    """Why matching can't run with the installed OpenCV, or None if it's fine."""
+    fix = (f'Close the app and double-click "Start Stitcher" again to fix it, or run:\n'
+           f'"{sys.executable}" -m pip install --user "opencv-python-headless<5" openpyxl')
+    try:
+        import cv2
+    except ImportError:
+        return "The image-matching part (OpenCV) isn't installed.\n\n" + fix
+    if not hasattr(cv2, "HOGDescriptor"):
+        return (f"This computer has OpenCV {getattr(cv2, '__version__', '?')}, which no longer includes "
+                f"the HOG features Identify uses (they were removed in OpenCV 5). "
+                f"OpenCV 4 is needed.\n\n" + fix)
+    return None
+
+
 def extract_features(gray):
     """HOG features of a greyscale uint8 image (same settings as the original script)."""
     import cv2
@@ -57,12 +82,32 @@ def read_gray(path):
 
 
 def image_features(path):
-    """Features of one image file, cached until the file changes."""
-    st = os.stat(path)
-    key = (path, st.st_mtime, st.st_size)
-    if key not in _feature_cache:
-        _feature_cache[key] = extract_features(read_gray(path))
-    return _feature_cache[key]
+    """Features of one image file. Kept in memory and in ~/.whisky_stitcher_features
+    until the file changes, so each image is only read once."""
+    if path in _file_stats:
+        mtime, size = _file_stats[path]
+    else:
+        st = os.stat(path)
+        mtime, size = st.st_mtime, st.st_size
+    key = (path, mtime, size)
+    if key in _feature_cache:
+        return _feature_cache[key]
+    name = hashlib.sha1(f"{FEATURE_VERSION}|{path}|{mtime}|{size}".encode("utf-8")).hexdigest()
+    disk = os.path.join(FEATURE_DIR, name + ".npy")
+    try:
+        f = np.load(disk)
+    except (OSError, ValueError):
+        f = extract_features(read_gray(path))
+        try:
+            os.makedirs(FEATURE_DIR, exist_ok=True)
+            tmp = disk + f".{os.getpid()}.tmp"
+            with open(tmp, "wb") as fh:
+                np.save(fh, f)
+            os.replace(tmp, disk)
+        except OSError:
+            pass
+    _feature_cache[key] = f
+    return f
 
 
 def _unit_rows(X):
@@ -80,18 +125,62 @@ def _is_image(fname):
     return fname.lower().endswith(core.IMG_EXTS) and not fname.startswith(".")
 
 
-def scan_database(folder):
-    """[(label, path)] for every image in the class sub-folders of `folder`."""
-    items = []
-    for label in sorted(os.listdir(folder)):
-        sub = os.path.join(folder, label)
-        if not os.path.isdir(sub) or label.startswith((".", "_")):
+def is_stitched(path):
+    """A stitched result: named "…_stitched" or kept in a "Stitched" folder."""
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    return stem.endswith("_stitched") or os.path.basename(os.path.dirname(path)) == core.OUT_DIR_NAME
+
+
+def code_order(label):
+    """Key order: A…Z, AA…AF, and 1, 2 … 10 numerically; other names alphabetically."""
+    short = len(label) <= 3 and label.isalnum()
+    return (0, len(label), label.upper()) if short else (1, 0, label.lower())
+
+
+def class_images(sub):
+    """Every image in one whisky's folder, searched recursively. Each file's
+    date and size come with the folder listing and are kept in _file_stats."""
+    found, dirs = [], []
+    with os.scandir(sub) as it:
+        entries = sorted(it, key=lambda e: e.name)
+    for e in entries:
+        if e.name.startswith((".", "_")):
             continue
-        for fname in sorted(os.listdir(sub)):
-            path = os.path.join(sub, fname)
-            if os.path.isfile(path) and _is_image(fname):
-                items.append((label, path))
-    return items
+        if e.is_dir():
+            dirs.append(e.path)
+        elif _is_image(e.name):
+            st = e.stat()
+            _file_stats[e.path] = (st.st_mtime, st.st_size)
+            found.append(e.path)
+    for d in dirs:
+        found += class_images(d)
+    return found
+
+
+def scan_classes(folder):
+    """([(label, [reference images])], [labels left out because they're not stitched yet]).
+
+    If any whisky folder has stitched images ("…_stitched" or in a "Stitched"
+    folder), only stitched images are used, so raw tiles are never compared, and
+    whisky folders without any are left out. If none do (a plain set of finished
+    images, like the original Learning_Database), every image is used."""
+    found = []
+    for label in sorted(os.listdir(folder), key=code_order):
+        sub = os.path.join(folder, label)
+        if os.path.isdir(sub) and not label.startswith((".", "_")):
+            images = class_images(sub)
+            if images:
+                found.append((label, images))
+    stitched = [(label, [p for p in images if is_stitched(p)]) for label, images in found]
+    if not any(paths for _, paths in stitched):
+        return found, []
+    return ([(label, paths) for label, paths in stitched if paths],
+            [label for label, paths in stitched if not paths])
+
+
+def scan_database(folder):
+    """[(label, path)] for every reference image in the class sub-folders of `folder`."""
+    return [(label, p) for label, paths in scan_classes(folder)[0] for p in paths]
 
 
 @dataclass
@@ -116,19 +205,27 @@ def build_database(folder, log=print, progress=None, should_stop=lambda: False):
     if not items:
         raise ValueError("no images found in sub-folders of this folder.\n"
                          "Put each whisky's reference images in its own sub-folder.")
-    feats, labels, paths, skipped = [], [], [], []
-    for i, (label, path) in enumerate(items):
-        if should_stop():
-            raise InterruptedError("stopped")
-        try:
-            feats.append(image_features(path))
-            labels.append(label)
-            paths.append(path)
-        except Exception as e:
-            skipped.append((path, str(e)))
-            log(f"  skipped {os.path.relpath(path, folder)}: {e}")
-        if progress:
-            progress(i + 1, len(items))
+    results, skipped = [None] * len(items), []
+    with ThreadPoolExecutor(READERS) as pool:
+        futures = {pool.submit(image_features, path): i for i, (_, path) in enumerate(items)}
+        for done, fut in enumerate(as_completed(futures), 1):
+            if should_stop():
+                for f in futures:
+                    f.cancel()
+                raise InterruptedError("stopped")
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                path = items[i][1]
+                skipped.append((path, str(e)))
+                log(f"  skipped {os.path.relpath(path, folder)}: {e}")
+            if progress:
+                progress(done, len(items))
+    keep = [i for i, r in enumerate(results) if r is not None]
+    feats = [results[i] for i in keep]
+    labels = [items[i][0] for i in keep]
+    paths = [items[i][1] for i in keep]
     if not feats:
         raise ValueError("none of the reference images could be opened.")
     return Database(folder, np.array(labels), paths, _unit_rows(feats), skipped)
@@ -138,7 +235,8 @@ def build_database(folder, log=print, progress=None, should_stop=lambda: False):
 #  Whisky key
 # --------------------------------------------------------------------------- #
 def find_key(db_folder):
-    """A whisky key spreadsheet inside or next to the reference folder, or ''."""
+    """A whisky key spreadsheet inside or next to the reference folder,
+    else the lab's key that comes with the app (Whisky_Key.csv)."""
     for where in (db_folder, os.path.dirname(os.path.normpath(db_folder))):
         try:
             names = sorted(os.listdir(where))
@@ -147,12 +245,20 @@ def find_key(db_folder):
         for fname in names:
             if "key" in fname.lower() and fname.lower().endswith(KEY_EXTS) and not fname.startswith("~$"):
                 return os.path.join(where, fname)
-    return ""
+    return BUILTIN_KEY if os.path.isfile(BUILTIN_KEY) else ""
 
 
 def load_key(path, labels=()):
-    """{class code: whisky name} from the first two columns of an .xlsx or .csv.
-    The first row is a header, unless its first cell is one of `labels`."""
+    """{class code: whisky name} from an .xlsx or .csv key (see load_key_details)."""
+    return load_key_details(path, labels)[0]
+
+
+def load_key_details(path, labels=()):
+    """({class code: whisky name}, {class code: (letter, sample number)}).
+
+    A key with a "Name" column is read by its headings (see _key_from_table).
+    Otherwise column 1 is the code and column 2 the name, and the first row is
+    a header unless its first cell is one of `labels`."""
     if path.lower().endswith(".csv"):
         with open(path, newline="", encoding="utf-8-sig") as f:
             rows = list(csv.reader(f))
@@ -168,10 +274,65 @@ def load_key(path, labels=()):
         if isinstance(v, float) and v.is_integer():
             v = int(v)                     # 1.0 -> "1", so numeric codes match folder names
         return "" if v is None else str(v).strip()
-    rows = [(cell(r[0]), cell(r[1])) for r in rows if len(r) >= 2]
+    rows = [[cell(v) for v in r] for r in rows]
+    rows = [r for r in rows if any(r)]
+    head = [h.lower() for h in rows[0]] if rows else []
+    if "name" in head:
+        return _key_from_table(head, rows[1:])
+    rows = [r[:2] for r in rows if len(r) >= 2]
     if rows and rows[0][0] not in set(labels):
         rows = rows[1:]
-    return {code: name for code, name in rows if code and name}
+    return {code: name for code, name in rows if code and name}, {}
+
+
+def _is_letter_col(h):
+    return h.startswith("letter") or h in ("code", "class", "folder")
+
+
+def _is_number_col(h):
+    """"Sample Number", "Sample No", "Number" – but not "Sample (50mL) price"."""
+    return ("price" not in h and "cost" not in h
+            and (h in ("number", "no", "no.", "#") or ("sample" in h and ("number" in h or " no" in h))))
+
+
+def _key_from_table(head, rows):
+    """Key with headed columns, like the lab's table:
+    Letter Designation | Sample Number | Name | Age | Strength (abv) | (prices…).
+    Folders may be named by letter or by number. Repeated names get their age
+    (or strength) added, e.g. "Glengoyne 15 YO", "Royal Lochnagar (60% abv)"."""
+    def col(test):
+        return next((i for i, h in enumerate(head) if test(h)), None)
+
+    def get(r, i):
+        return r[i] if i is not None and i < len(r) else ""
+    name_i = head.index("name")
+    age_i = col(lambda h: h == "age" or h.startswith("age "))
+    abv_i = col(lambda h: "strength" in h or "abv" in h)
+    letter_i = col(_is_letter_col)
+    number_i = col(_is_number_col)
+    if letter_i is None and number_i is None:
+        letter_i = 0 if name_i != 0 else None
+    repeats = {}
+    for r in rows:
+        n = get(r, name_i).lower()
+        repeats[n] = repeats.get(n, 0) + 1
+    names, ids = {}, {}
+    for r in rows:
+        name = get(r, name_i)
+        if not name:
+            continue
+        if repeats[name.lower()] > 1:
+            age, abv = get(r, age_i), get(r, abv_i)
+            if age.replace(".", "", 1).isdigit():
+                name = f"{name} {age} YO"
+            elif abv:
+                name = f"{name} ({abv}% abv)"
+        letter, number = get(r, letter_i), get(r, number_i)
+        for code in (letter, number):
+            if code:
+                names.setdefault(code, name)
+                ids.setdefault(code, (letter, number))
+    return names, ids
 
 
 # --------------------------------------------------------------------------- #

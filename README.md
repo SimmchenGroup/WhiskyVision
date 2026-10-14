@@ -54,7 +54,8 @@ You need an internet connection the first time you start the stitcher. It downlo
    away. Changes apply to every selected sample, so you can select several (Ctrl-click or
    Shift-click) and change them all at once. Click the ☑ next to a sample to leave it out.
    The **‹** button folds the list away to give the pictures more room.
-4. Press **Stitch N samples**. Each sample's status changes to *Done* as it finishes, and
+4. Press **Stitch N samples**. The sample being stitched is selected automatically, so the
+   pictures follow along. Each sample's status changes to *Done* as it finishes, and
    **Show log** has the details.
 5. Press **Open results folder**, or switch After to **Saved** to check each result.
 
@@ -120,16 +121,44 @@ compared with every reference image by cosine similarity. The closest reference 
    ```
 
    A spreadsheet with "key" in its name, in or next to that folder, is picked up automatically
-   (first row = headings). Without one, the folder names are shown, so you can also just name
+   (first row = headings). Otherwise the lab's key that comes with the app (`Whisky_Key.csv`:
+   letter, sample number, name, age, strength) is used, so folders can be named by letter (`A`)
+   or sample number (`1`). Without one, the folder names are shown, so you can also just name
    the folders after the whiskies. **Check database** matches every reference image against all
    the others and shows how often each whisky is recognised.
+
+   Only **stitched** images are used as references (`…_stitched` files or a `Stitched` folder
+   inside each whisky's folder), never raw tiles. Whisky folders without stitched images yet
+   are left out and listed as *not stitched yet*. If no folder has stitched images at all,
+   every image is used. The first run reads every reference image, which is slow over a
+   network drive. Their features are then saved in `.whisky_stitcher_features` in your home
+   folder, so later runs start in seconds.
 2. **Test images:** **Add folder** (for example the `Stitched` folder) or **Add files**.
 3. Press **Identify N images**. Click an image to see it next to its closest reference, with the
-   best score for each whisky (1.000 = identical).
+   best score for each whisky (1.000 = identical). Click any whisky in that list, or use **‹ ›**
+   or the **← →** keys, to see that whisky's closest image instead. Whiskies are shown with their
+   letter and sample number from the key, e.g. `M · #13  Glenlivet 25YO`.
 
 If a test image's name starts with the class code and `_` (`O_4.tif` is class `O`), or it's in a
 folder named after the class, the **Result** column shows ✓ or ✗ and the overall percentage.
 **Save results (CSV)** writes everything to a spreadsheet.
+
+## Gallery tab
+
+**Gallery** shows thumbnails of every stitched sample in the Identify tab's reference folder,
+grouped by whisky (using the whisky key's names). **Change folder** changes it for both tabs.
+
+- It shows the same images Identify compares against: only stitched ones, never raw tiles.
+- The **Whiskies** list on the left jumps to each whisky's section.
+- **Click a thumbnail** to open the full image in your usual image viewer.
+- **Remove a bad image:** point at it and click its **✕** (or right-click it). It's moved to a
+  `_removed` folder inside the reference folder, not deleted, so you can put it back. If the
+  tiles it was stitched from are found, that sample is marked **Redo** on the Stitch tab, ready
+  to stitch again.
+- Type in the filter box to find a whisky or file name, and use **Small / Medium / Large** to
+  change the thumbnail size.
+- Thumbnails are cached in `.whisky_stitcher_thumbs` in your home folder, so big TIFFs are
+  only read once. Press **Refresh** after adding new images.
 
 ## Troubleshooting
 
@@ -156,6 +185,7 @@ folder named after the class, the **Result** column shows ✓ or ✗ and the ove
 | `fonts/` | Caprasimo and Figtree (SIL Open Font License, see the `OFL-*.txt` files). They're loaded privately when the app starts (GDI on Windows, CoreText on macOS), so nothing is installed on the computer. |
 | `stitcher_core.py` | Scanning and grouping files, grid layout, ImageJ macro generation, and running Fiji headless. |
 | `identify_gui.py` | The Identify tab, built the first time it's opened. |
+| `gallery_gui.py` | The Gallery tab: thumbnail grid of the reference folder, cached on disk, opens images in the system viewer. |
 | `identify_core.py` | HOG + cosine-similarity matching, adapted from *Whisky Web Identification.py*. It shows the whisky of the **matched** reference (the original script looked up the test file's own prefix, so it printed the expected answer). scikit-learn/pandas are replaced by the equivalent numpy/openpyxl code, and the scores are identical. Command line: `python identify_core.py <reference folder> <test images or folder> [--key Whisky_Key.xlsx]` |
 | `stitch_native.py` | Pure-Python engine. Can also be used from the command line: `python stitch_native.py <folder> [--rows R --cols C --order "Row by row"]` |
 | `legacy/` | The earlier scripts (`prepare.py`, `stitch.py`, `rename.py`), which generated a macro to run by hand in Fiji. |
