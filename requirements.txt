@@ -5,3 +5,6 @@ imagecodecs
 customtkinter
 opencv-python-headless<5    # OpenCV 5 removed HOGDescriptor, which Identify needs
 openpyxl
+matplotlib                  # ML tab figures only (ml_core.figure_*); the rest of the app runs without it
+# Optional, for the ML tab's pretrained-CNN feature sets only (CPU build, about 1 GB):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu

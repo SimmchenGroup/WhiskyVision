@@ -31,6 +31,8 @@ import csv
 import hashlib
 import os
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -157,13 +159,55 @@ def class_images(sub):
     return found
 
 
-def scan_classes(folder):
+_scan_cache = {}           # normcase(folder) -> (time, result)
+_scan_locks = {}           # normcase(folder) -> Lock
+SCAN_CACHE_SECONDS = 600   # the Identify and Gallery tabs share one scan for this long
+                           # (Refresh / changing folder / finishing a stitch scan again)
+
+
+def scan_classes(folder, fresh=False):
     """([(label, [reference images])], [labels left out because they're not stitched yet]).
 
     If any whisky folder has stitched images ("…_stitched" or in a "Stitched"
     folder), only stitched images are used, so raw tiles are never compared, and
     whisky folders without any are left out. If none do (a plain set of finished
-    images, like the original Learning_Database), every image is used."""
+    images, like the original Learning_Database), every image is used.
+
+    The result is cached for SCAN_CACHE_SECONDS (a scan of a big folder on a network
+    drive takes seconds); fresh=True scans again."""
+    key = os.path.normcase(os.path.normpath(folder))
+    started = time.monotonic()
+    with _scan_locks.setdefault(key, threading.Lock()):   # a scan already running is waited for
+        hit = _scan_cache.get(key)
+        if hit and (hit[0] >= started or (not fresh and started - hit[0] < SCAN_CACHE_SECONDS)):
+            result = hit[1]
+        else:
+            result = _scan_classes(folder)
+            _scan_cache[key] = (time.monotonic(), result)
+    return [(label, list(paths)) for label, paths in result[0]], list(result[1])
+
+
+def prefetch_scan(folder):
+    """Scan `folder` in a background thread, so the tabs find it cached."""
+    if folder and os.path.isdir(folder):
+        threading.Thread(target=lambda: scan_classes(folder), daemon=True).start()
+
+
+def forget_images(folder, paths):
+    """Drop images that were moved away from the cached scan of `folder`, so the
+    tabs can update without scanning the whole folder again."""
+    hit = _scan_cache.get(os.path.normcase(os.path.normpath(folder)))
+    if not hit:
+        return
+    gone = {os.path.normcase(p) for p in paths}
+    found, unstitched = hit[1]
+    found = [(label, [p for p in ps if os.path.normcase(p) not in gone]) for label, ps in found]
+    unstitched = list(unstitched) + [label for label, ps in found if not ps]
+    found = [(label, ps) for label, ps in found if ps]
+    _scan_cache[os.path.normcase(os.path.normpath(folder))] = (hit[0], (found, unstitched))
+
+
+def _scan_classes(folder):
     found = []
     for label in sorted(os.listdir(folder), key=code_order):
         sub = os.path.join(folder, label)

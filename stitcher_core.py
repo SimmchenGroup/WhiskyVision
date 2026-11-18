@@ -14,7 +14,9 @@ everything before it is the sample name.
     001_0.tiff                 ->  sample "001",               tile 0
 
 Output for every sample: <folder>/Stitched/<sample>_stitched.tif
-The original tiles are never renamed, moved or modified.
+Stitching never renames, moves or modifies the original tiles. The only thing
+that renames them is split_sample(), when the user splits a wrongly named
+sample in the GUI (every rename is written to <folder>/_split_log.txt).
 """
 import glob
 import json
@@ -111,12 +113,24 @@ def guess_grid(n):
     return rows, cols
 
 
+file_stats = {}       # path -> (mtime, size), noted while scanning (free with os.scandir)
+
+
 def scan_folder(folder):
-    """Return (samples, ignored_filenames). Only the top level of `folder` is scanned."""
+    """Return (samples, ignored_filenames). Only the top level of `folder` is scanned.
+    Uses one directory listing: on a network drive a separate check per file costs ~30 ms."""
     groups, ignored = {}, []
-    for fname in sorted(os.listdir(folder)):
-        full = os.path.join(folder, fname)
-        if not os.path.isfile(full):
+    with os.scandir(folder) as it:
+        entries = sorted(it, key=lambda e: e.name)
+    for e in entries:
+        fname, full = e.name, e.path
+        try:
+            if not e.is_file():
+                continue
+            if fname.lower().endswith(IMG_EXTS):
+                st = e.stat()
+                file_stats[full] = (st.st_mtime, st.st_size)
+        except OSError:
             continue
         parsed = parse_name(fname)
         if parsed is None:
@@ -141,6 +155,112 @@ def scan_folder(folder):
             s.warnings.append("Mixed file types: " + ", ".join(sorted(exts)))
         samples.append(s)
     return samples, ignored
+
+
+# --------------------------------------------------------------------------- #
+#  Splitting a wrongly named sample
+# --------------------------------------------------------------------------- #
+_PARTS_RE = re.compile(r"^(?P<sample>.+?)(?P<sep>\s*[_\s])(?P<index>\d+)(?P<tail>\s*)(?P<ext>\.[A-Za-z]+)$")
+_TRAILING_NUM = re.compile(r"^(.*?)(\d+)$")
+SPLIT_LOG = "_split_log.txt"
+
+
+def new_sample_names(existing, base, count):
+    """`count` unused sample names that continue the numbering after the highest in `existing`.
+    For base "007" with samples up to "012": "013", "014", … (same zero-padding).
+    Names without a trailing number get "_2", "_3", … instead."""
+    existing = set(existing)
+    names = []
+    m = _TRAILING_NUM.match(base)
+    if m:
+        prefix, width = m.group(1), len(m.group(2))
+        nums = [int(mm.group(2)) for n in existing
+                if (mm := _TRAILING_NUM.match(n)) and mm.group(1) == prefix]
+        nxt = max(nums, default=int(m.group(2))) + 1
+        while len(names) < count:
+            cand = f"{prefix}{nxt:0{width}d}"
+            if cand not in existing:
+                names.append(cand)
+            nxt += 1
+    else:
+        k = 2
+        while len(names) < count:
+            cand = f"{base}_{k}"
+            if cand not in existing:
+                names.append(cand)
+            k += 1
+    return names
+
+
+def plan_split(sample, groups, existing):
+    """Work out the renames for splitting `sample`.
+
+    groups: one group number per tile (same order as sample.tiles). Group 1 keeps the
+    sample's name; every other non-empty group, in number order, gets a new name from
+    new_sample_names(). Tiles keep their order and are renumbered from the sample's
+    first tile number with the same separator and zero-padding, so no gaps are left.
+    Returns ([(group, name, [(old path, new path)])], error or None)."""
+    if len(groups) != sample.n:
+        return [], "Every tile needs a group"
+    used = sorted(set(groups))
+    if len(used) < 2:
+        return [], "Put at least one tile in another group"
+    others = [g for g in used if g != 1]
+    new_names = dict(zip(others, new_sample_names(existing, sample.name, len(others))))
+    start = sample.tiles[0][0]
+    plan = []
+    for g in used:
+        name = sample.name if g == 1 else new_names[g]
+        moves = []
+        tiles = [t for t, tg in zip(sample.tiles, groups) if tg == g]
+        for k, (_, path) in enumerate(tiles):
+            fname = os.path.basename(path)
+            m = _PARTS_RE.match(fname)
+            if not m:
+                return [], f"Can't read the tile number in {fname}"
+            index = f"{start + k:0{len(m.group('index'))}d}"
+            new = f"{name}{m.group('sep')}{index}{m.group('tail')}{m.group('ext')}"
+            moves.append((path, os.path.join(os.path.dirname(path), new)))
+        plan.append((g, name, moves))
+    return plan, None
+
+
+def split_sample(folder, plan):
+    """Carry out a plan_split() plan: rename the tiles on disk.
+    Renames go through temporary names (so tiles can swap numbers) and are undone if
+    anything fails. Every rename is appended to <folder>/_split_log.txt."""
+    moves = [(old, new) for _, _, ms in plan for old, new in ms if os.path.normcase(old) != os.path.normcase(new)]
+    sources = {os.path.normcase(old) for old, _ in moves}
+    for old, new in moves:
+        if os.path.exists(new) and os.path.normcase(new) not in sources:
+            raise FileExistsError(f"{os.path.basename(new)} already exists")
+    done = []                                   # (from, to) renames, for undo
+    try:
+        temps = []
+        for i, (old, new) in enumerate(moves):
+            tmp = os.path.join(os.path.dirname(old), f".splitting_{os.getpid()}_{i}{os.path.splitext(old)[1]}")
+            os.rename(old, tmp)
+            done.append((old, tmp))
+            temps.append((tmp, new))
+        for tmp, new in temps:
+            os.rename(tmp, new)
+            done.append((tmp, new))
+    except OSError:
+        for a, b in reversed(done):
+            try:
+                os.rename(b, a)
+            except OSError:
+                pass
+        raise
+    try:
+        with open(os.path.join(folder, SPLIT_LOG), "a", encoding="utf-8") as f:
+            f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}  split into "
+                    f"{', '.join(name for _, name, _ in plan)}\n")
+            for old, new in moves:
+                f.write(f"{os.path.basename(old)}\t->\t{os.path.basename(new)}\n")
+    except OSError:
+        pass
+    return moves
 
 
 # --------------------------------------------------------------------------- #

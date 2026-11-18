@@ -36,6 +36,33 @@ FONT_DIR = os.path.join(HERE, "fonts")
 TILE_THUMB = 1000      # max edge of cached tile thumbnails (px)
 RESULT_THUMB = 2000    # max edge of cached saved-result thumbnails (px)
 QUICK_EDGE = 480       # tiles are shrunk to this for the quick preview stitch
+THUMB_CACHE = os.path.join(os.path.expanduser("~"), ".whisky_stitcher_thumbs")
+
+
+def cached_thumbnail(path, edge):
+    """A PIL thumbnail of `path`, kept on the local disk so big TIFFs on a network
+    drive are decoded only once (the cache key changes when the file does)."""
+    import hashlib
+    stats = core.file_stats.get(path)
+    if stats is None:
+        st = os.stat(path)
+        stats = (st.st_mtime, st.st_size)
+    key = hashlib.sha1(f"{path}|{stats[0]}|{stats[1]}|{edge}".encode("utf-8")).hexdigest()
+    cache = os.path.join(THUMB_CACHE, key + ".jpg")
+    if os.path.exists(cache):
+        try:
+            with Image.open(cache) as im:
+                return im.convert("RGB")
+        except OSError:
+            pass
+    im = Image.fromarray(core.read_rgb(path))
+    im.thumbnail((edge, edge))
+    try:
+        os.makedirs(THUMB_CACHE, exist_ok=True)
+        im.save(cache, quality=92)
+    except OSError:
+        pass
+    return im
 ZOOMS = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
 
 # Organic palette (from the mockup's design system)
@@ -75,6 +102,24 @@ Tiles must end in "_<number>", e.g.
     S24-1273_4X_1uL_01.tiff, S24-1273_4X_1uL_02.tiff, …
 Everything before the last "_" is the sample name, so all tiles of one
 object must share it.
+
+SPLITTING A WRONGLY NAMED SAMPLE
+
+If tiles of two or more objects were saved under one name, click the
+sample and press "Split…" (or right-click it). Give each tile a group
+(click a picture to move it to the next group; use + / − for more or
+fewer groups). Group 1 keeps the name; every other group becomes a new
+sample numbered after the highest one in the list (e.g. 013, 014). The
+tile files are renamed, and every rename is listed in _split_log.txt in
+the tile folder. An old stitch of the original name is marked Redo.
+
+REDO
+
+Right-click a sample › "Mark Redo / clear Redo" to flag it. Redo marks
+are saved in Stitched/_redo.txt, so they're still there after a restart,
+and they stay visible even when the sample is unticked. A sample with no
+image in the Stitched folder shows "Not stitched". Stitching a sample
+successfully clears its Redo mark.
 
 TILE ORDER  (always starts at the top-left tile)
 
@@ -184,7 +229,14 @@ class StitcherApp(ctk.CTk):
         self.thumbs = {}            # path -> PIL thumbnail (None if unreadable)
         self.thumb_errors = {}      # path -> why it couldn't be opened
         self.loading = set()        # paths being decoded in the background
+        self.load_queue = []        # [(paths, edge)] for the loader thread, newest last
+        self.load_cv = threading.Condition()
+        threading.Thread(target=self._loader, daemon=True).start()
         self.done_cache = {}        # (path, mtime, size) -> result file is complete
+        self.out_stats = {}         # normcase(path) -> (mtime, size) for files in Stitched
+        self._checking_outputs = False
+        self.size_cache = {}        # (path, stat) -> (w, h) of a saved result
+        self._row_cache = {}        # sample -> (tag, values) last shown in the table
         self.quick_cache = {}       # settings key -> {"image", "rows", "cols"} or error text
         self.quick_pending = set()
         self.before_images, self.after_images = [], []   # keep PhotoImages alive
@@ -200,6 +252,7 @@ class StitcherApp(ctk.CTk):
         self.page = tk.StringVar(value="Stitch")
         self.identify = None        # IdentifyTab, made the first time it's opened
         self.gallery = None         # GalleryTab, likewise (it shares Identify's folder)
+        self.ml = None              # MLTab, likewise
 
         s = self.settings
         self.folder = tk.StringVar(value=s.get("folder", ""))
@@ -219,6 +272,8 @@ class StitcherApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if sys.platform.startswith("win"):
             self.after(0, lambda: self.state("zoomed"))
+        # scan the Identify/Gallery reference folder in the background, ready for those tabs
+        self.after(500, lambda: __import__("identify_core").prefetch_scan(s.get("id_database", "")))
         if self.folder.get() and os.path.isdir(self.folder.get()):
             self.after(300, self.scan)
         else:
@@ -260,7 +315,7 @@ class StitcherApp(ctk.CTk):
         bar.grid_columnconfigure(2, weight=1, minsize=500)
         ctk.CTkLabel(bar, text=APP_TITLE, font=self.F.head(22), text_color=C["text"]).grid(
             row=0, column=0, padx=(28, 18), pady=18)
-        ctk.CTkSegmentedButton(bar, values=["Stitch", "Identify", "Gallery"], variable=self.page,
+        ctk.CTkSegmentedButton(bar, values=["Stitch", "Identify", "Gallery", "ML"], variable=self.page,
                                command=self.show_page, font=self.F.semi(14), height=36,
                                corner_radius=18, fg_color=C["bg"], selected_color=C["accent"],
                                selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
@@ -305,6 +360,7 @@ class StitcherApp(ctk.CTk):
         self.all_none.grid(row=0, column=4)
         self._link(self.all_none, "All", lambda: self._set_all(True)).pack(side="left")
         self._link(self.all_none, "None", lambda: self._set_all(False)).pack(side="left")
+        self._link(self.all_none, "Split…", self.split_current).pack(side="left")
         self.chevron = ctk.CTkButton(head, text="‹", width=32, height=32, corner_radius=16,
                                      fg_color=C["bg"], hover_color=C["hover_tint"],
                                      text_color=C["text"], font=self.F.semi(16),
@@ -334,6 +390,13 @@ class StitcherApp(ctk.CTk):
             self.tree.tag_configure(tag, foreground=colour)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
         self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree_menu = tk.Menu(self, tearoff=0)
+        self.tree_menu.add_command(label="Split into samples…", command=self.split_current)
+        self.tree_menu.add_command(label="Mark Redo / clear Redo", command=self._toggle_redo)
+        self.tree.bind("<Button-3>", self._on_tree_menu)
+        if sys.platform == "darwin":
+            self.tree.bind("<Button-2>", self._on_tree_menu)
+            self.tree.bind("<Control-Button-1>", self._on_tree_menu)
 
         # -- Options card
         self.options = ctk.CTkFrame(self.left, fg_color=C["surface"], corner_radius=28)
@@ -555,12 +618,15 @@ class StitcherApp(ctk.CTk):
     def show_page(self, name):
         """Switch between the Stitch, Identify and Gallery tabs."""
         try:
-            if name in ("Identify", "Gallery") and self.identify is None:
+            if name in ("Identify", "Gallery", "ML") and self.identify is None:
                 from identify_gui import IdentifyTab
                 self.identify = IdentifyTab(self, C, badge_image)
             if name == "Gallery" and self.gallery is None:
                 from gallery_gui import GalleryTab
                 self.gallery = GalleryTab(self, C, self.identify)
+            if name == "ML" and self.ml is None:
+                from ml_gui import MLTab
+                self.ml = MLTab(self, C, self.identify)
         except Exception as e:
             messagebox.showerror(APP_TITLE, f"The {name} tab couldn't start:\n{e}")
             self.page.set("Stitch")
@@ -568,7 +634,7 @@ class StitcherApp(ctk.CTk):
         stitch = name == "Stitch"
         for w in (self.stitch_body, self.stitch_runbar, self.folder_pill, self.rescan_link):
             w.grid() if stitch else w.grid_remove()
-        for tab, tab_name in ((self.identify, "Identify"), (self.gallery, "Gallery")):
+        for tab, tab_name in ((self.identify, "Identify"), (self.gallery, "Gallery"), (self.ml, "ML")):
             if tab is not None:
                 tab.show() if name == tab_name else tab.hide()
 
@@ -585,10 +651,12 @@ class StitcherApp(ctk.CTk):
         if name not in self.samples:
             return False
         self.redo.add(name)
+        self._save_redo()
         self.selected[name] = True
         self.status.pop(name, None)
         out = self.samples[name].output_path(self.folder.get())
         self.thumbs.pop(out, None)
+        self._restat_output(out)              # the Gallery may just have moved it away
         self._refresh_table()
         self.tree.selection_set(name)
         self.tree.see(name)
@@ -633,7 +701,10 @@ class StitcherApp(ctk.CTk):
         return box
 
     def show_help(self):
-        if self.page.get() == "Gallery":
+        if self.page.get() == "ML":
+            from ml_gui import HELP_TEXT as ML_HELP
+            self._text_window("ML", ML_HELP, 760, 760)
+        elif self.page.get() == "Gallery":
             from gallery_gui import HELP_TEXT as GALLERY_HELP
             self._text_window("Gallery", GALLERY_HELP, 640, 440)
         elif self.page.get() == "Identify":
@@ -656,13 +727,18 @@ class StitcherApp(ctk.CTk):
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Couldn't read the folder:\n{e}")
             return
+        same = os.path.normcase(os.path.normpath(folder)) == getattr(self, "_scanned_folder", None)
+        self._scanned_folder = os.path.normcase(os.path.normpath(folder))
         self.samples = {s.name: s for s in samples}
         self.selected = {s.name: True for s in samples}
         self.status = {}
-        self.redo = set()
+        # Redo marks are saved in Stitched/_redo.txt, so they survive a restart
+        kept = self.redo if same else set()
+        self.redo = {n for n in kept | self._load_redo(folder) if n in self.samples}
         self.thumbs.clear()
         self.thumb_errors.clear()
         self.quick_cache.clear()
+        self._scan_outputs()
         self._refresh_table()
         self.log(f"Found {len(samples)} sample(s) in {folder}")
         if ignored:
@@ -697,6 +773,110 @@ class StitcherApp(ctk.CTk):
             if name:
                 self.selected[name] = not self.selected[name]
                 self._refresh_table()
+
+    def _on_tree_menu(self, event):
+        name = self.tree.identify_row(event.y)
+        if not name:
+            return
+        if name not in self.tree.selection():
+            self.tree.selection_set(name)
+            self.tree.focus(name)
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+    def _toggle_redo(self):
+        names = self.tree.selection()
+        if not names:
+            return
+        on = not all(n in self.redo for n in names)
+        for n in names:
+            (self.redo.add if on else self.redo.discard)(n)
+            self.status.pop(n, None)
+        self._save_redo()
+        self._refresh_table()
+
+    # ------------------------------------------------------------- redo file
+    REDO_FILE = "_redo.txt"
+
+    def _redo_path(self, folder=None):
+        return os.path.join(folder or self.folder.get(), core.OUT_DIR_NAME, self.REDO_FILE)
+
+    def _load_redo(self, folder):
+        try:
+            with open(self._redo_path(folder), encoding="utf-8") as f:
+                return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        except OSError:
+            return set()
+
+    def _save_redo(self):
+        """Write the Redo marks to <tile folder>/Stitched/_redo.txt (removed when empty)."""
+        folder = self.folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            return
+        path = self._redo_path(folder)
+        try:
+            if self.redo:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("# Samples marked Redo in the Whisky Webs Stitcher (one per line)\n")
+                    f.write("\n".join(sorted(self.redo)) + "\n")
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            self.log(f"Couldn't save the Redo list: {e}")
+
+    # ------------------------------------------------------------- split
+    def split_current(self):
+        """Open the Split window for the sample selected in the list."""
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(APP_TITLE, "Wait for stitching to finish before splitting a sample.")
+            return
+        s = self._current_sample()
+        if s is None:
+            messagebox.showinfo(APP_TITLE, "Click the sample you want to split first.")
+            return
+        if s.n < 2:
+            messagebox.showinfo(APP_TITLE, f"“{s.name}” has only one tile, so there's nothing to split.")
+            return
+        from split_dialog import SplitDialog
+        SplitDialog(self, C, s, self._do_split)
+
+    def _do_split(self, sample, plan):
+        folder = self.folder.get()
+        summary = "\n".join(f"  {name}: {len(m)} tile{'s' if len(m) != 1 else ''}" for _, name, m in plan)
+        if not messagebox.askyesno(APP_TITLE, f"Split “{sample.name}” into:\n\n{summary}\n\n"
+                                              f"The tile files will be renamed (every rename is listed in "
+                                              f"{core.SPLIT_LOG} in the tile folder)."):
+            return
+        try:
+            moves = core.split_sample(folder, plan)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, f"Couldn't split the sample, nothing was changed:\n{e}")
+            return
+        for old, new in moves:
+            self.log(f"Split: {os.path.basename(old)} -> {os.path.basename(new)}")
+            self.thumbs.pop(old, None)
+        # An old result for the original name was made from all the tiles: mark it Redo.
+        keep_sel = {n: v for n, v in self.selected.items()}
+        names = [name for _, name, _ in plan]
+        if os.path.exists(sample.output_path(folder)) and sample.name in names:
+            self.redo.add(sample.name)
+        if sample.name not in names:          # all its tiles moved to new names
+            self.redo.discard(sample.name)
+        self._save_redo()
+        self.scan()
+        for n, v in keep_sel.items():
+            if n in self.selected:
+                self.selected[n] = v
+        self._refresh_table()
+        shown = [n for n in names if self.tree.exists(n)]
+        if shown:
+            self.tree.selection_set(shown)
+            self.tree.focus(shown[0])
+            self.tree.see(shown[-1])
+        self.status_label.configure(text=f"Split “{sample.name}” into {', '.join(names)}")
 
     def _on_engine(self):
         imagej = self.engine.get() == "imagej"
@@ -750,36 +930,91 @@ class StitcherApp(ctk.CTk):
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", out])
 
     # =================================================================== table
-    def _done_cached(self, path):
-        """core.output_ok, cached per file version (the table refreshes often)."""
+    # The table is refreshed on almost every click and needs every sample's result file.
+    # On a network drive each os.stat / open costs ~30 ms, so the Stitched folder is
+    # listed once (os.scandir gives the sizes for free) and the files' TIFF headers are
+    # checked in a background thread.
+    def _scan_outputs(self):
+        """Note the date and size of every file in the Stitched folder (one listing)."""
+        self.out_stats = {}
+        out = os.path.join(self.folder.get(), core.OUT_DIR_NAME)
+        try:
+            with os.scandir(out) as it:
+                for e in it:
+                    if e.is_file():
+                        st = e.stat()
+                        self.out_stats[os.path.normcase(e.path)] = (st.st_mtime, st.st_size)
+        except OSError:
+            pass
+        self._check_outputs()
+
+    def _restat_output(self, path):
+        """Re-read one result file's date and size (after it was written or moved)."""
+        key = os.path.normcase(path)
         try:
             st = os.stat(path)
+            self.out_stats[key] = (st.st_mtime, st.st_size)
         except OSError:
+            self.out_stats.pop(key, None)
+        self._check_outputs()
+
+    def _out_stat(self, path):
+        return self.out_stats.get(os.path.normcase(path))
+
+    def _done_cached(self, path):
+        """True if the result file exists and is complete. Until its header has been
+        checked in the background, a non-empty file counts as complete."""
+        st = self._out_stat(path)
+        if st is None or st[1] == 0:
             return False
-        key = (path, st.st_mtime, st.st_size)
-        if key not in self.done_cache:
-            self.done_cache[key] = core.output_ok(path)
-        return self.done_cache[key]
+        return self.done_cache.get((os.path.normcase(path),) + st, True)
+
+    def _check_outputs(self):
+        """Check the headers of result files not checked yet, off the UI thread."""
+        if self._checking_outputs:
+            return
+        folder = self.folder.get()
+        todo = []
+        for s in self.samples.values():
+            out = s.output_path(folder)
+            st = self._out_stat(out)
+            if st and st[1] and (os.path.normcase(out),) + st not in self.done_cache:
+                todo.append(((os.path.normcase(out),) + st, out))
+        if not todo:
+            return
+        self._checking_outputs = True
+
+        def work():
+            results = {}
+            for key, path in todo:
+                try:
+                    core.image_size(path)
+                    results[key] = True
+                except Exception:
+                    results[key] = False
+            self.events.put(("outputs_checked", results))
+        threading.Thread(target=work, daemon=True).start()
 
     def _row_status(self, s):
         """(text, tag) for the Status column."""
         if s.name in self.status:
             return self.status[s.name]
-        if not self.selected.get(s.name):
-            return "Skipped", "off"
-        p = s.problem()
-        if p:
-            return "Fix layout", "bad"
-        if s.name in self.redo:
-            return "Redo", "redo"
+        on = self.selected.get(s.name)
         out = s.output_path(self.folder.get())
-        if self.skip_done.get() and self._done_cached(out):
+        missing = self._out_stat(out) is None
+        broken = not missing and not self._done_cached(out)
+        # Redo and "not stitched" are shown even when unticked, to keep track of them
+        if s.name in self.redo or broken:
+            return ("Redo", "redo") if on else ("Redo (skipped)", "redo")
+        if not on:
+            return ("Not stitched (skipped)", "off") if missing else ("Skipped", "off")
+        if s.problem():
+            return "Fix layout", "bad"
+        if not missing and self.skip_done.get():
             return "Stitched", "done"
-        if os.path.exists(out) and not self._done_cached(out):
-            return "Redo", "redo"
         if s.warnings:
             return "Check tiles", "redo"
-        return "Ready", "ready"
+        return ("Not stitched", "ready") if missing else ("Ready", "ready")
 
     def _todo(self):
         folder = self.folder.get()
@@ -790,16 +1025,26 @@ class StitcherApp(ctk.CTk):
 
     def _refresh_table(self):
         sel = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
+        rows = []
         for name, s in self.samples.items():
             text, tag = self._row_status(s)
             grid = "auto" if s.n == 2 else f"{s.rows} × {s.cols}"
             order = s.order if s.n > 2 else ("auto (pair)" if s.n == 2 else "—")
-            self.tree.insert("", "end", iid=name, tags=(tag,), values=(
-                "☑" if self.selected[name] else "☐", name, s.n, grid, order, "●  " + text))
-        keep = [n for n in sel if self.tree.exists(n)]
-        if keep:
-            self.tree.selection_set(keep)
+            rows.append((name, tag, ("☑" if self.selected[name] else "☐", name, s.n, grid, order,
+                                     "●  " + text)))
+        if list(self.tree.get_children()) == [r[0] for r in rows]:
+            # same samples: update only the rows that changed (rebuilding is slow and flickers)
+            for name, tag, values in rows:
+                if self._row_cache.get(name) != (tag, values):
+                    self.tree.item(name, tags=(tag,), values=values)
+        else:
+            self.tree.delete(*self.tree.get_children())
+            for name, tag, values in rows:
+                self.tree.insert("", "end", iid=name, tags=(tag,), values=values)
+            keep = [n for n in sel if self.tree.exists(n)]
+            if keep:
+                self.tree.selection_set(keep)
+        self._row_cache = {name: (tag, values) for name, tag, values in rows}
         n_sel = sum(self.selected.values())
         self.count_label.configure(text=f"{n_sel} / {len(self.samples)}" if self.samples else "")
         if not (self.worker and self.worker.is_alive()):
@@ -814,6 +1059,7 @@ class StitcherApp(ctk.CTk):
             self.cur_order.set(s.order)
             self.pan = [0.0, 0.0]
         self._draw_previews()
+        self._prefetch_next()
 
     def _current_sample(self):
         names = self.tree.selection()
@@ -882,27 +1128,53 @@ class StitcherApp(ctk.CTk):
     def _thumb(self, path, edge):
         if path not in self.thumbs:
             try:
-                im = Image.fromarray(core.read_rgb(path))
-                im.thumbnail((edge, edge))
-                self.thumbs[path] = im
+                self.thumbs[path] = cached_thumbnail(path, edge)
             except Exception as e:
                 self.thumbs[path] = None
                 self.thumb_errors[path] = str(e)
         return self.thumbs[path]
 
-    def _load_then_draw(self, paths, edge=TILE_THUMB):
-        """Decode thumbnails off the UI thread, then redraw."""
-        paths = [p for p in paths if p not in self.loading]
+    def _load_then_draw(self, paths, edge=TILE_THUMB, prefetch=False):
+        """Decode thumbnails in the loader thread, then redraw. The newest request is
+        served first (the sample just clicked); prefetch requests wait at the back."""
+        paths = tuple(p for p in paths if p not in self.thumbs)
         if not paths:
             return
-        self.loading.update(paths)
+        with self.load_cv:
+            self.load_queue = [r for r in self.load_queue if r[0] != paths]
+            if prefetch:
+                self.load_queue.insert(0, (paths, edge))
+            else:
+                self.load_queue.append((paths, edge))
+            self.load_cv.notify()
 
-        def work():
-            for p in paths:
-                self._thumb(p, edge)
-                self.loading.discard(p)
+    def _loader(self):
+        """Background thread: one request at a time, newest first."""
+        while True:
+            with self.load_cv:
+                while not self.load_queue:
+                    self.load_cv.wait()
+                paths, edge = self.load_queue.pop()
+            for i, p in enumerate(paths):
+                if p not in self.thumbs:
+                    self._thumb(p, edge)
+                with self.load_cv:
+                    newer = bool(self.load_queue)
+                if newer and i + 1 < len(paths):    # something newer was clicked: do that first
+                    with self.load_cv:
+                        self.load_queue.insert(0, (paths[i + 1:], edge))
+                    break
             self.events.put(("redraw", None))
-        threading.Thread(target=work, daemon=True).start()
+
+    def _prefetch_next(self):
+        """Load the next sample's tiles while the user looks at this one."""
+        names = list(self.samples)
+        s = self._current_sample()
+        if s is None or s.name not in names:
+            return
+        i = names.index(s.name)
+        for name in names[i + 1:i + 3]:
+            self._load_then_draw(self.samples[name].paths, prefetch=True)
 
     def _tiles_ready(self, s):
         missing = [p for p in s.paths if p not in self.thumbs]
@@ -1077,7 +1349,7 @@ class StitcherApp(ctk.CTk):
         cv = self.after_canvas
         out = s.output_path(self.folder.get())
         self.after_note.configure(text=os.path.basename(out))
-        if not os.path.exists(out):
+        if self._out_stat(out) is None:
             self._message(cv, "Not stitched yet – press Stitch to make it")
             return
         if out not in self.thumbs:
@@ -1090,11 +1362,15 @@ class StitcherApp(ctk.CTk):
                               "Press Stitch to make it again.", C["order"])
             return
         self._place_image(cv, im, self.after_images)
-        try:
-            w, h = core.image_size(out)
+        key = (out, self._out_stat(out))
+        if key not in self.size_cache:       # reading the header is slow on network drives
+            try:
+                self.size_cache[key] = core.image_size(out)
+            except Exception:
+                self.size_cache[key] = None
+        if self.size_cache[key]:
+            w, h = self.size_cache[key]
             self.after_note.configure(text=f"{os.path.basename(out)} · {w} × {h} pixels")
-        except Exception:
-            pass
 
     # ================================================================ running
     def log(self, msg):
@@ -1106,7 +1382,7 @@ class StitcherApp(ctk.CTk):
         self.settings.update(folder=self.folder.get(), engine=self.engine.get(), fiji=self.fiji.get(),
                              overlap=int(self.overlap.get()), refine=bool(self.refine.get()),
                              skip_done=bool(self.skip_done.get()))
-        for tab in (self.identify, self.gallery):
+        for tab in (self.identify, self.gallery, self.ml):
             if tab is not None:
                 self.settings.update(tab.settings())
         core.save_settings(self.settings)
@@ -1197,8 +1473,11 @@ class StitcherApp(ctk.CTk):
                 elif kind == "done":
                     name, ok = data
                     self.status[name] = ("Done", "done") if ok else ("Failed", "bad")
-                    if ok:
+                    if name in self.samples:
+                        self._restat_output(self.samples[name].output_path(self.folder.get()))
+                    if ok and name in self.redo:
                         self.redo.discard(name)
+                        self._save_redo()
                     self.finished += 1
                     self.progress.set(self.finished / max(1, self.total))
                     self.run_btn.configure(text=f"Stitching {self.finished} / {self.total}")
@@ -1214,15 +1493,27 @@ class StitcherApp(ctk.CTk):
                     n_bad = sum(1 for t, _ in self.status.values() if t == "Failed")
                     self.stop_btn.configure(state="disabled")
                     self.run_btn.configure(state="normal")
+                    import identify_core
+                    identify_core._scan_cache.clear()   # new results: Identify/Gallery scan again
+                    if self.gallery is not None:
+                        self.gallery.shown_folder = None
                     self._refresh_table()
                     self.log(f"Finished: {n_ok} stitched, {n_bad} failed. Results are in the "
                              f"\"{core.OUT_DIR_NAME}\" folder.")
+                elif kind == "outputs_checked":
+                    self._checking_outputs = False
+                    self.done_cache.update(data)
+                    if not all(data.values()):
+                        self._refresh_table()
+                    self._check_outputs()          # anything that changed meanwhile
                 elif kind == "redraw":
                     self._draw_previews()
                 elif kind.startswith("id_") and self.identify is not None:
                     self.identify.handle(kind, data)
                 elif kind.startswith("gal_") and self.gallery is not None:
                     self.gallery.handle(kind, data)
+                elif kind.startswith("ml_") and self.ml is not None:
+                    self.ml.handle(kind, data)
                 elif kind == "quick":
                     key, result = data
                     self.quick_pending.discard(key)

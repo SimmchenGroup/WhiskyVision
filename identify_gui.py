@@ -131,7 +131,7 @@ class IdentifyTab:
                              text_color=C["soft"], font=F.body(13), height=30,
                              placeholder_text="Folder with one sub-folder per whisky")
         entry.grid(row=0, column=0, sticky="ew", padx=(14, 4))
-        entry.bind("<Return>", lambda e: self._scan_database())
+        entry.bind("<Return>", lambda e: self._scan_database(fresh=True))
         ctk.CTkButton(pill, text="Browse…", command=self.browse_database, height=30, width=90,
                       corner_radius=15, fg_color=C["text"], hover_color=C["soft"], text_color=C["bg"],
                       font=F.head(13)).grid(row=0, column=1, padx=4, pady=4)
@@ -308,9 +308,9 @@ class IdentifyTab:
         if d:
             self.db_folder.set(os.path.normpath(d))
             self.key_path.set("")           # look for this folder's own key
-            self._scan_database()
+            self._scan_database(fresh=True)
 
-    def _scan_database(self, quiet=False):
+    def _scan_database(self, quiet=False, fresh=False):
         folder = self.db_folder.get().strip()
         self.db_items = []
         if not folder:
@@ -319,7 +319,7 @@ class IdentifyTab:
             self.db_info.configure(text="This folder doesn't exist")
         else:
             try:
-                found, unstitched = idc.scan_classes(folder)
+                found, unstitched = idc.scan_classes(folder, fresh=fresh)
             except OSError as e:
                 self.db_info.configure(text=f"Couldn't read the folder: {e}")
             else:

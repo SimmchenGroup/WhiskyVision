@@ -17,6 +17,7 @@ found, marks that sample "Redo" on the Stitch tab.
 Thumbnails are cached in ~/.whisky_stitcher_thumbs, so big stitched TIFFs are
 only decoded once.
 """
+import bisect
 import hashlib
 import os
 import queue
@@ -66,16 +67,23 @@ the dataset. It's moved to a "_removed" folder inside the reference
 folder, not deleted, so you can put it back. If the tiles it was stitched
 from can be found (the folder above its "Stitched" folder, or the folder
 open on the Stitch tab), that sample is marked Redo on the Stitch tab so
-you can stitch it again."""
+you can stitch it again.
+
+REMOVING MANY AT ONCE
+
+Click "Select" (top right). Click pictures to tick them, Shift-click to
+tick a range, or press "Select all" to tick everything shown (type in the
+filter box first to select all of one whisky). Press "Remove selected" to
+move them all to "_removed" in one go. Press "Done" to leave Select mode."""
 
 
 # --------------------------------------------------------------------------- #
 #  Finding images
 # --------------------------------------------------------------------------- #
-def collect(folder):
+def collect(folder, fresh=False):
     """([(whisky code, [image paths])], [codes with only unstitched tiles]).
-    The same images the Identify tab uses as references."""
-    return idc.scan_classes(folder)
+    The same images the Identify tab uses as references (and the same cached scan)."""
+    return idc.scan_classes(folder, fresh=fresh)
 
 
 def cached_thumb(path):
@@ -103,6 +111,17 @@ def cached_thumb(path):
     return im
 
 
+def fit_to(im, px):
+    """A copy of `im` scaled so its longer side is `px`."""
+    t = im.copy()
+    if max(t.size) > px:
+        t.thumbnail((px, px), Image.LANCZOS)
+    else:
+        scale = px / max(t.size)
+        t = t.resize((max(1, int(t.width * scale)), max(1, int(t.height * scale))), Image.BILINEAR)
+    return t
+
+
 def open_file(path):
     if sys.platform.startswith("win"):
         os.startfile(path)
@@ -121,9 +140,10 @@ def show_in_folder(path):
         subprocess.Popen(["xdg-open", os.path.dirname(path)])
 
 
-def stitch_source(path, extra_folders=()):
+def stitch_source(path, extra_folders=(), cache=None):
     """(tile folder, sample name) of the tiles a "<sample>_stitched" image was made from, or None.
-    Looks next to the image's "Stitched" folder, beside the image, then in `extra_folders`."""
+    Looks next to the image's "Stitched" folder, beside the image, then in `extra_folders`.
+    `cache` (a dict) keeps each folder's sample names between calls."""
     stem = os.path.splitext(os.path.basename(path))[0]
     if not stem.lower().endswith("_stitched"):
         return None
@@ -132,11 +152,16 @@ def stitch_source(path, extra_folders=()):
     folders = [os.path.dirname(parent)] if os.path.basename(parent) == core.OUT_DIR_NAME else []
     folders += [parent] + [f for f in extra_folders if f]
     for folder in folders:
-        try:
-            samples, _ = core.scan_folder(folder)
-        except OSError:
-            continue
-        if any(s.name == sample for s in samples):
+        if cache is not None and folder in cache:
+            names = cache[folder]
+        else:
+            try:
+                names = {s.name for s in core.scan_folder(folder)[0]}
+            except OSError:
+                names = set()
+            if cache is not None:
+                cache[folder] = names
+        if sample in names:
             return folder, sample
     return None
 
@@ -181,6 +206,14 @@ class GalleryTab:
         self.size = tk.StringVar(value=app.settings.get("gallery_size", "Medium"))
         self._layout_job = None
         self._last_width = 0
+        self.tile_by_tag, self.tile_y, self._tile_bottoms = {}, {}, []
+        self.drawn = set()           # tags of tiles drawn on the canvas so far
+        self.px = SIZES["Medium"]
+        self.view = (0, 0)           # canvas y range being drawn (read by the loader)
+        self._render_job = None
+        self.select_mode = False
+        self.selected = set()        # paths ticked in Select mode
+        self._anchor = None          # last ticked path, for Shift-click ranges
         self._build()
         threading.Thread(target=self._loader, daemon=True).start()
 
@@ -209,8 +242,25 @@ class GalleryTab:
                                selected_hover_color=C["accent_hover"], unselected_color=C["surface"],
                                unselected_hover_color=C["hover_tint"], text_color=C["text"]).grid(
             row=0, column=4, padx=(0, 6))
-        app._link(head, "Change folder", self.change_folder, 14).grid(row=0, column=5)
-        app._link(head, "Refresh", lambda: self.refresh(force=True), 14).grid(row=0, column=6)
+        self.select_link = app._link(head, "Select", self.toggle_select, 14)
+        self.select_link.grid(row=0, column=5)
+        app._link(head, "Change folder", self.change_folder, 14).grid(row=0, column=6)
+        app._link(head, "Refresh", lambda: self.refresh(force=True), 14).grid(row=0, column=7)
+
+        # -- selection bar, shown while Select is on
+        self.sel_bar = bar = ctk.CTkFrame(head, fg_color=C["accent_tint"], corner_radius=20)
+        bar.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(10, 0))
+        bar.grid_columnconfigure(0, weight=1)
+        self.sel_label = ctk.CTkLabel(bar, text="", font=F.semi(14), text_color=C["accent_ink"], anchor="w")
+        self.sel_label.grid(row=0, column=0, sticky="w", padx=18, pady=6)
+        app._link(bar, "Select all", self.select_all, 14).grid(row=0, column=1)
+        app._link(bar, "Clear", self.select_none, 14).grid(row=0, column=2)
+        self.sel_remove = ctk.CTkButton(bar, text="Remove selected", command=self.remove_selected,
+                                        height=30, corner_radius=15, fg_color=C["error"],
+                                        hover_color="#8f1e18", text_color="#ffffff", font=F.semi(14))
+        self.sel_remove.grid(row=0, column=3, padx=(8, 6), pady=6)
+        app._link(bar, "Done", self.toggle_select, 14).grid(row=0, column=4, padx=(0, 10))
+        bar.grid_remove()
 
         # -- navigation pane
         nav = ctk.CTkFrame(self.body, fg_color=C["surface"], corner_radius=28, width=300)
@@ -296,30 +346,40 @@ class GalleryTab:
         self.groups, self.unstitched = [], []
         if folder and os.path.isdir(folder):
             try:
-                self.groups, self.unstitched = collect(folder)
+                self.groups, self.unstitched = collect(folder, fresh=force)
             except OSError as e:
                 self.summary.configure(text=f"Couldn't read the folder: {e}")
         self._schedule_layout(0)
 
     # ------------------------------------------------------------- loading
     def _loader(self):
-        """Background thread: make thumbnails one at a time, in display order."""
+        """Background thread: make thumbnails one at a time, in display order, already
+        resized for display. Pictures scrolled far out of view are skipped (they're
+        queued again when they come back into view)."""
         while True:
-            gen, path = self.jobs.get()
+            gen, path, px = self.jobs.get()
             if gen != self.generation or path in self.thumbs:
+                self.queued.discard(path)
+                continue
+            y, (lo, hi) = self.tile_y.get(path), self.view
+            if y is None or not lo - 600 <= y <= hi + 600:
+                self.queued.discard(path)
                 continue
             try:
                 im = cached_thumb(path)
+                disp = fit_to(im, px)
             except Exception:
-                im = None
-            self.app.events.put(("gal_thumb", (gen, path, im)))
+                im = disp = None
+            self.app.events.put(("gal_thumb", (gen, path, im, disp, px)))
 
     def handle(self, kind, data):
         if kind == "gal_thumb":
-            gen, path, im = data
+            gen, path, im, disp, px = data
             self.thumbs[path] = im
             self.queued.discard(path)
             if gen == self.generation:
+                if disp is not None and px == self.px and path not in self.photos:
+                    self.photos[path] = ImageTk.PhotoImage(disp)
                 self._place_thumb(path)
 
     # ---------------------------------------------------------- navigation
@@ -363,6 +423,7 @@ class GalleryTab:
     def _on_scroll(self, first, last):
         """Scrollbar update; highlight the whisky whose section is at the top."""
         self.scrollbar.set(first, last)
+        self._schedule_render()
         if not self.group_y or time.monotonic() - self._jumped < 0.4:
             return
         top = float(first) * self.content_h
@@ -424,6 +485,7 @@ class GalleryTab:
                            font=(self.F.body_family, 13), justify="center")
             self.content_h = 240
             cv.configure(scrollregion=(0, 0, W, 240))
+            self._update_sel_bar()
 
         if not folder:
             self.summary.configure(text="")
@@ -442,8 +504,12 @@ class GalleryTab:
             text += f" · not stitched yet: {', '.join(self.unstitched)}"
         self.summary.configure(text=text)
         shown = folder if len(folder) <= 90 else "…" + folder[-89:]
-        self.note.configure(text=f"{shown}   ·   Click a picture to open it full size, ✕ or right-click "
-                                 f"to remove it from the dataset.")
+        if self.select_mode:
+            self.note.configure(text=f"{shown}   ·   Click pictures to select them (Shift-click for a "
+                                     f"range), then press Remove selected.")
+        else:
+            self.note.configure(text=f"{shown}   ·   Click a picture to open it full size, ✕ or right-click "
+                                     f"to remove it from the dataset.")
         if not groups:
             return message("No images here." if not self.groups else "Nothing matches the filter.")
         self._build_nav(groups)
@@ -451,7 +517,6 @@ class GalleryTab:
         cell_w = px + GAP
         cols = max(1, int((W - MARGIN) // cell_w))
         y = 6
-        order = []
         for code, name, paths in groups:
             self.group_y.append((y, code))
             cv.create_text(MARGIN / 2, y + 18, anchor="w", text=name, fill=C["text"],
@@ -464,31 +529,71 @@ class GalleryTab:
                 r, c = divmod(i, cols)
                 x0 = MARGIN / 2 + c * cell_w
                 y0 = y + r * (px + LABEL_H + GAP)
-                tag = f"p{len(order)}"
-                cv.create_rectangle(x0, y0, x0 + px, y0 + px, fill=C["well"], outline=C["well"],
-                                    width=2, tags=(tag, tag + "box"))
-                self.items[path] = (cv.create_image(x0 + px / 2, y0 + px / 2, tags=(tag,)), tag)
-                label = os.path.splitext(os.path.basename(path))[0]
-                cv.create_text(x0 + px / 2, y0 + px + 13, text=_ellipsize(label, px, 7),
-                               fill=C["soft"], font=(self.F.body_family, 10), tags=(tag,))
-                # remove button, shown while the mouse is over the picture
-                bx, by = x0 + px - X_R - 6, y0 + X_R + 6
-                cv.create_oval(bx - X_R, by - X_R, bx + X_R, by + X_R, fill=C["text"], outline=C["bg"],
-                               width=1.5, state="hidden", tags=(tag + "x",))
-                cv.create_text(bx, by, text="✕", fill=C["bg"], font=(self.F.body_family, 10),
-                               state="hidden", tags=(tag + "x",))
+                tag = f"p{len(self.tiles)}"
+                bx, by = x0 + px - X_R - 6, y0 + X_R + 6      # remove button (shown on hover)
                 self.tiles.append((x0, y0, x0 + px, y0 + px + LABEL_H, path, tag, bx, by))
-                order.append(path)
-                self._place_thumb(path)
             rows = -(-len(paths) // cols)
             y += rows * (px + LABEL_H + GAP) + 8
+        # Only the pictures near the visible part are drawn (see _render_visible):
+        # thousands of canvas items make every scroll and redraw slow.
+        self.tile_by_tag = {t[5]: t for t in self.tiles}
+        self.tile_y = {t[4]: t[1] for t in self.tiles}
+        self._tile_bottoms = [t[3] for t in self.tiles]
+        self.drawn = set()
+        self.px = px
         self.content_h = y + 10
         cv.configure(scrollregion=(0, 0, W, self.content_h))
-        gen = self.generation
-        for path in order:                     # queue missing thumbnails, top first
-            if path not in self.thumbs and path not in self.queued:
-                self.queued.add(path)
-                self.jobs.put((gen, path))
+        self._update_sel_bar()
+        self._render_visible()
+
+    def _schedule_render(self):
+        if not self._render_job:
+            def go():
+                self._render_job = None
+                self._render_visible()
+            self._render_job = self.app.after_idle(go)
+
+    def _render_visible(self):
+        """Draw the pictures in (and a screen either side of) the visible area,
+        and queue their thumbnails, top first."""
+        if not self.tiles:
+            return
+        cv = self.canvas
+        H = max(cv.winfo_height(), 300)
+        top = cv.canvasy(0)
+        lo, hi = top - H, top + 2 * H
+        self.view = (lo, hi)
+        gen, want = self.generation, []
+        i = bisect.bisect_left(self._tile_bottoms, lo)
+        while i < len(self.tiles) and self.tiles[i][1] <= hi:
+            t = self.tiles[i]
+            if t[5] not in self.drawn:
+                self._draw_tile(t)
+            if t[4] not in self.thumbs and t[4] not in self.queued:
+                want.append(t[4])
+            i += 1
+        for path in want:
+            self.queued.add(path)
+            self.jobs.put((gen, path, self.px))
+
+    def _draw_tile(self, t):
+        C, cv, px = self.C, self.canvas, self.px
+        x0, y0, _, _, path, tag, _, _ = t
+        cv.create_rectangle(x0, y0, x0 + px, y0 + px, fill=C["well"], outline=C["well"],
+                            width=2, tags=(tag, tag + "box"))
+        self.items[path] = (cv.create_image(x0 + px / 2, y0 + px / 2, tags=(tag,)), tag)
+        label = os.path.splitext(os.path.basename(path))[0]
+        cv.create_text(x0 + px / 2, y0 + px + 13, text=_ellipsize(label, px, 7),
+                       fill=C["soft"], font=(self.F.body_family, 10), tags=(tag,))
+        if self.select_mode:                  # selection tick
+            cx, cy = x0 + X_R + 6, y0 + X_R + 6
+            cv.create_oval(cx - X_R, cy - X_R, cx + X_R, cy + X_R, fill=C["bg"], outline=C["bg"],
+                           width=1.5, tags=(tag + "ck", tag + "ckdot"))
+            cv.create_text(cx, cy, text="✓", fill="#ffffff", font=(self.F.body_family, 11, "bold"),
+                           state="hidden", tags=(tag + "ckmark",))
+        self.drawn.add(tag)
+        self._place_thumb(path)
+        self._paint_tag(tag, path in self.selected)
 
     def _place_thumb(self, path):
         entry = self.items.get(path)
@@ -505,18 +610,10 @@ class GalleryTab:
             cv.create_text(x, y, text="Couldn't open", fill=self.C["order"],
                            font=(self.F.body_family, 10), tags=(tag,))
             return
-        px = SIZES.get(self.size.get(), 190)
         ph = self.photos.get(path)
         if ph is None:
-            t = im.copy()
-            if max(t.size) > px:
-                t.thumbnail((px, px), Image.LANCZOS)
-            else:
-                scale = px / max(t.size)
-                t = t.resize((max(1, int(t.width * scale)), max(1, int(t.height * scale))), Image.BILINEAR)
-            ph = self.photos[path] = ImageTk.PhotoImage(t)
+            ph = self.photos[path] = ImageTk.PhotoImage(fit_to(im, self.px))
         cv.itemconfigure(item, image=ph)
-        cv.tag_raise(tag + "x")
 
     # ----------------------------------------------------------- mouse
     def _tile_at(self, e):
@@ -529,15 +626,21 @@ class GalleryTab:
     def _set_hover(self, tag):
         if tag == self.hover:
             return
-        cv = self.canvas
-        if self.hover:
-            cv.itemconfigure(self.hover + "box", outline=self.C["well"])
-            cv.itemconfigure(self.hover + "x", state="hidden")
+        cv, C = self.canvas, self.C
+        old, self.hover = self.hover, tag
+        cv.delete("hoverx")
+        if old:
+            self._paint_tag(old)
         if tag:
-            cv.itemconfigure(tag + "box", outline=self.C["accent"])
-            cv.itemconfigure(tag + "x", state="normal")
+            cv.itemconfigure(tag + "box", outline=C["accent"])
+            t = self.tile_by_tag.get(tag)
+            if t and not self.select_mode:    # remove button, only on the picture under the mouse
+                bx, by = t[6], t[7]
+                cv.create_oval(bx - X_R, by - X_R, bx + X_R, by + X_R, fill=C["text"], outline=C["bg"],
+                               width=1.5, tags=("hoverx",))
+                cv.create_text(bx, by, text="✕", fill=C["bg"], font=(self.F.body_family, 10),
+                               tags=("hoverx",))
         cv.configure(cursor="hand2" if tag else "")
-        self.hover = tag
 
     def _on_motion(self, e):
         t, _ = self._tile_at(e)
@@ -545,8 +648,98 @@ class GalleryTab:
 
     def _on_click(self, e):
         t, on_x = self._tile_at(e)
-        if t:
-            self.remove(t[4]) if on_x else self._open(t[4])
+        if not t:
+            return
+        if self.select_mode:
+            self._toggle(t[4], shift=bool(e.state & 0x0001))
+        elif on_x:
+            self.remove(t[4])
+        else:
+            self._open(t[4])
+
+    # ----------------------------------------------------------- select
+    def toggle_select(self):
+        """Turn Select mode on or off (off clears the selection)."""
+        self.select_mode = not self.select_mode
+        self.selected.clear()
+        self._anchor = None
+        self.select_link.configure(text="Done" if self.select_mode else "Select")
+        if self.select_mode:
+            self.sel_bar.grid()
+        else:
+            self.sel_bar.grid_remove()
+        self._schedule_layout(0)
+
+    def _visible_paths(self):
+        return [t[4] for t in self.tiles]
+
+    def _toggle(self, path, shift=False):
+        paths = self._visible_paths()
+        if shift and self._anchor in paths:
+            a, b = sorted((paths.index(self._anchor), paths.index(path)))
+            for p in paths[a:b + 1]:
+                self.selected.add(p)
+                self._paint_selected(p)
+        else:
+            if path in self.selected:
+                self.selected.discard(path)
+            else:
+                self.selected.add(path)
+            self._paint_selected(path)
+        self._anchor = path
+        self._update_sel_bar()
+
+    def select_all(self):
+        """Tick every picture currently shown (respects the filter)."""
+        for p in self._visible_paths():
+            self.selected.add(p)
+            self._paint_selected(p)
+        self._update_sel_bar()
+
+    def select_none(self):
+        paths = list(self.selected)
+        self.selected.clear()
+        for p in paths:
+            self._paint_selected(p)
+        self._update_sel_bar()
+
+    def _paint_selected(self, path):
+        entry = self.items.get(path)
+        if entry:
+            self._paint_tag(entry[1], path in self.selected)
+
+    def _paint_tag(self, tag, on=None):
+        """Draw a tile's outline and tick for its selected state."""
+        cv, C = self.canvas, self.C
+        if tag not in self.drawn:
+            return
+        if on is None:
+            t = self.tile_by_tag.get(tag)
+            on = t is not None and t[4] in self.selected
+        hovered = tag == self.hover
+        cv.itemconfigure(tag + "box", outline=C["accent"] if (on or hovered) else C["well"],
+                         width=4 if on else 2)
+        if self.select_mode:
+            cv.itemconfigure(tag + "ckdot", state="normal", fill=C["accent"] if on else C["bg"],
+                             outline="#ffffff" if on else C["muted"])
+            cv.itemconfigure(tag + "ckmark", state="normal" if on else "hidden")
+        else:
+            cv.itemconfigure(tag + "ckdot", state="hidden")
+            cv.itemconfigure(tag + "ckmark", state="hidden")
+
+    def _update_sel_bar(self):
+        if not self.select_mode:
+            return
+        shown = set(self._visible_paths())
+        self.selected &= set(p for _, paths in self.groups for p in paths)   # drop vanished files
+        n = len(self.selected)
+        hidden = len(self.selected - shown)
+        text = f"{n} selected" if n else "Click pictures to select them"
+        if hidden:
+            text += f" ({hidden} hidden by the filter)"
+        self.sel_label.configure(text=text)
+        self.sel_remove.configure(text=f"Remove selected ({n})" if n else "Remove selected",
+                                  state="normal" if n else "disabled")
 
     def _on_menu(self, e):
         t, _ = self._tile_at(e)
@@ -588,7 +781,8 @@ class GalleryTab:
         self.log(f"Removed {os.path.relpath(path, root)} from the dataset (moved to {dest})")
         self.thumbs.pop(path, None)
         self.photos.pop(path, None)
-        self.shown_folder = None              # re-read the folder
+        idc.forget_images(root, [path])       # update the cached scan instead of re-reading
+        self.shown_folder = None
         self.refresh()
         self.identify._scan_database(quiet=True)
         if source:
@@ -598,6 +792,75 @@ class GalleryTab:
                 messagebox.showinfo(self.app.title(), "Stitching is running, so the sample couldn't be "
                                                       f"marked Redo yet. Open {source[0]} on the Stitch tab "
                                                       "and stitch it again.")
+
+    def remove_selected(self):
+        """Move every selected image out of the dataset in one go."""
+        root = self.folder()
+        paths = [p for p in self.selected if os.path.exists(p)]
+        if not paths:
+            return
+        n = len(paths)
+        hidden = len(set(paths) - set(self._visible_paths()))
+        text = (f"Remove {n} image{'s' if n != 1 else ''} from the dataset?\n\n"
+                f"They're moved to the \"{REMOVED_DIR}\" folder inside the reference folder, not deleted, "
+                f"so you can put them back. The Gallery and Identify tabs ignore that folder.")
+        if hidden:
+            text += f"\n\n{hidden} of them are hidden by the current filter."
+        if not messagebox.askyesno(self.app.title(), text, icon="warning"):
+            return
+        self.app.configure(cursor="watch")
+        self.app.update_idletasks()
+        cache, sources, failed, moved_paths = {}, [], [], []
+        extra = [self.app.folder.get()]
+        try:
+            for path in paths:
+                source = stitch_source(path, extra, cache)
+                try:
+                    move_to_removed(path, root)
+                except OSError as e:
+                    failed.append(f"{os.path.basename(path)}: {e}")
+                    continue
+                self.thumbs.pop(path, None)
+                self.photos.pop(path, None)
+                moved_paths.append(path)
+                if source:
+                    sources.append(source)
+        finally:
+            self.app.configure(cursor="")
+        moved = n - len(failed)
+        self.log(f"Removed {moved} image{'s' if moved != 1 else ''} from the dataset "
+                 f"(moved to {os.path.join(root, REMOVED_DIR)})")
+        idc.forget_images(root, moved_paths)  # update the cached scan instead of re-reading
+        self.selected.clear()
+        self._anchor = None
+        self.shown_folder = None
+        self.refresh()
+        self.identify._scan_database(quiet=True)
+
+        # Mark Redo for the tiles that were found. The Stitch tab shows one folder at a time,
+        # so use the one already open there if it has any, otherwise the most common one.
+        msg = []
+        if sources:
+            folders = [os.path.normcase(os.path.normpath(f)) for f, _ in sources]
+            current = os.path.normcase(os.path.normpath(self.app.folder.get() or "."))
+            target = current if current in folders else max(set(folders), key=folders.count)
+            names = [s for (f, s), nf in zip(sources, folders) if nf == target]
+            marked = [s for s in names if self.app.mark_redo(sources[folders.index(target)][0], s)]
+            if marked:
+                self.app.status_label.configure(
+                    text=f"{len(marked)} sample{'s' if len(marked) != 1 else ''} marked Redo – "
+                         f"press Stitch to redo {'them' if len(marked) != 1 else 'it'}")
+            elif names:
+                msg.append("Stitching is running, so no samples could be marked Redo yet.")
+            other = len(sources) - len(names)
+            if other:
+                msg.append(f"{other} other sample{'s are' if other != 1 else ' is'} in different tile "
+                           f"folders; open those on the Stitch tab to re-stitch them.")
+        if failed:
+            msg.insert(0, f"{len(failed)} image{'s' if len(failed) != 1 else ''} couldn't be moved:\n"
+                       + "\n".join(failed[:10]) + ("\n…" if len(failed) > 10 else ""))
+        if msg:
+            messagebox.showinfo(self.app.title(), "\n\n".join(msg))
 
 
 def tkfont_width(family, size, text, widget):
