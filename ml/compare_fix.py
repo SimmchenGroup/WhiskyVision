@@ -20,8 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ml_core as mc  # noqa: E402
 
 OUT = sys.argv[1]
-H = r"C:\Users\joshk\jarvis\jarvis\home\outputs\whisky"
-CACHE, F_RAW, F_NORM = os.path.join(H, "ml_cache"), os.path.join(H, "ml_features"), os.path.join(H, "ml_features_norm")
+import ml_paths  # noqa: E402  (set WHISKY_ML_WORK, see ml_paths.py)
+CACHE = ml_paths.need(ml_paths.IMAGE_CACHE, "cache_images.py")
+F_RAW = ml_paths.need(ml_paths.FEATURES, "extract_features.py + embed_cnn.py")
+F_NORM = ml_paths.need(ml_paths.FEATURES_NORM, "extract_features.py --norm + embed_cnn.py")
 mc.CACHE_DIR = os.path.join(OUT, "cache")          # keep ~/.whisky_stitcher_ml free of these paths
 log = open(os.path.join(OUT, "log.txt"), "a", buffering=1)
 

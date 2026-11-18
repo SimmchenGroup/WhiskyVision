@@ -10,14 +10,9 @@ os.makedirs(OUT, exist_ok=True)
 mc.CACHE_DIR = OLD                         # feature records (ml-v2) already there; new CNN files are added
 log = open(os.path.join(OUT, "log.txt"), "a", buffering=1)
 say = lambda *a: print(*a, file=log, flush=True)
-C = r"C:\Users\joshk\jarvis\jarvis\home\outputs\whisky\ml_cache"
-paths, labels = [], []
-for L in sorted(os.listdir(C)):
-    d = os.path.join(C, L)
-    if os.path.isdir(d):
-        for f in sorted(os.listdir(d)):
-            if f.endswith(".png"):
-                paths.append(os.path.join(d, f)); labels.append(L)
+import ml_paths
+C = ml_paths.IMAGE_CACHE                   # set WHISKY_ML_WORK (see ml_paths.py)
+paths, labels = ml_paths.image_cache_paths()
 say("=== start", time.ctime(), mc.CNN_VERSION)
 recs, _ = mc.features_many(paths, labels, downsample=1, log=say, workers=12)
 recs = [r for r in recs if r is not None]
