@@ -67,16 +67,18 @@ def resolve(num, group):
     if num in key:
         return key[num], ""
     if num.startswith("S20-") and ("S18-" + num[4:]) in key and "/Orange" in group or "/Pink" in group and             ("S18-" + num[4:]) in key:
-        return key["S18-" + num[4:]], f"assumed S18-{num[4:]} (file says {num})"
+        return key["S18-" + num[4:]], f"file says {num}; is S18-{num[4:]} (typo confirmed by Josh 19 Nov 2026)"
     manual = {"S22-1934": "S22-1954", "S22-2139": "S22-2149"}
     if num in manual:
-        return key[manual[num]], f"assumed {manual[num]} (file says {num})"
+        return key[manual[num]], f"file says {num}; is {manual[num]} (typo confirmed by Josh 19 Nov 2026)"
     return None, ""
 
 
 rows, unmapped = [], []
 for (group, num, vol, variant), d in sorted(drops.items()):
     k, alias = resolve(num, group)
+    if k is None and group.startswith("Counterfeit"):
+        k = dict(product="counterfeit (no key)", product_id="counterfeit", category="Counterfeit", set="counterfeit")
     parts = group.split("/")
     cls = parts[0]                                          # Counterfeit / Different_Years / Normal
     sub = "/".join(parts[1:])                              # colour folder (+ scope for Normal)

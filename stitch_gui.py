@@ -744,13 +744,64 @@ class StitcherApp(ctk.CTk):
         if ignored:
             self.log(f"Ignored {len(ignored)} image(s) without a tile number, e.g. {ignored[0]}")
         if not samples:
-            messagebox.showinfo(APP_TITLE, "No tiles found in this folder.\n\nTile files must end in "
-                                           "\"_<number>\", e.g. Sample_01.tiff (see Help).")
             self._draw_previews()
+            subs = self._sub_folders(folder)
+            if subs:                     # a parent folder (e.g. one folder per whisky): pick one
+                self.log(f"No tiles directly in {folder}; it has {len(subs)} sub-folder(s)")
+                self._choose_sub_folder(folder, subs)
+            else:
+                messagebox.showinfo(APP_TITLE, "No tiles found in this folder.\n\nTile files must end in "
+                                               "\"_<number>\", e.g. Sample_01.tiff (see Help).")
         else:
             first = self.tree.get_children()[0]
             self.tree.selection_set(first)
             self.tree.focus(first)
+
+    @staticmethod
+    def _sub_folders(folder):
+        """Sub-folders that could hold tiles (not Stitched, _removed, hidden ones…)."""
+        try:
+            with os.scandir(folder) as it:
+                names = [e.name for e in it if e.is_dir() and e.name != core.OUT_DIR_NAME
+                         and not e.name.startswith(("_", "."))]
+        except OSError:
+            return []
+        try:
+            from identify_core import code_order
+            return sorted(names, key=code_order)
+        except Exception:  # noqa: BLE001
+            return sorted(names, key=str.lower)
+
+    def _choose_sub_folder(self, folder, subs):
+        """The chosen folder holds sub-folders, not tiles: let the user pick one."""
+        win = ctk.CTkToplevel(self, fg_color=C["bg"])
+        win.title("Choose a sample folder")
+        win.resizable(False, False)
+        win.transient(self)
+        ctk.CTkLabel(win, text="This folder has no tiles itself", font=self.F.head(20),
+                     text_color=C["text"]).pack(anchor="w", padx=24, pady=(20, 2))
+        ctk.CTkLabel(win, text=f"{os.path.basename(folder) or folder} contains these folders. "
+                               "Pick the one whose tiles you want to stitch:",
+                     font=self.F.body(13), text_color=C["muted"], wraplength=520, justify="left").pack(
+            anchor="w", padx=24, pady=(0, 12))
+        grid = ctk.CTkScrollableFrame(win, fg_color=C["surface"], corner_radius=20, width=520,
+                                      height=min(320, 52 * ((len(subs) + 5) // 6) + 24))
+        grid.pack(fill="both", padx=24)
+        per_row = 6
+
+        def pick(name):
+            win.destroy()
+            self.folder.set(os.path.normpath(os.path.join(folder, name)))
+            self.scan()
+        for i, name in enumerate(subs):
+            self._pill_button(grid, name, lambda n=name: pick(n), height=38, size=14, width=76).grid(
+                row=i // per_row, column=i % per_row, padx=4, pady=4)
+        bar = ctk.CTkFrame(win, fg_color="transparent")
+        bar.pack(fill="x", padx=24, pady=(12, 18))
+        self._link(bar, "Browse…", lambda: (win.destroy(), self.browse())).pack(side="left")
+        self._link(bar, "Cancel", win.destroy).pack(side="right")
+        win.after(50, win.lift)
+        win.after(80, win.focus_force)
 
     def _set_field(self, field, value):
         """Rows / Columns / Order changed: apply to every selected sample."""
@@ -1495,6 +1546,12 @@ class StitcherApp(ctk.CTk):
                     self.run_btn.configure(state="normal")
                     import identify_core
                     identify_core._scan_cache.clear()   # new results: Identify/Gallery scan again
+                    try:
+                        import collections_core
+                        with collections_core._lock:
+                            collections_core._scan_cache.clear()
+                    except ImportError:
+                        pass
                     if self.gallery is not None:
                         self.gallery.shown_folder = None
                     self._refresh_table()

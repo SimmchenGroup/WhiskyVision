@@ -197,3 +197,39 @@ ml_core.view_cnn_map(cm)   # red = CNN evidence for the target, blue = against, 
 - **Coarse by nature:** the true resolution is 8 × 8 (each cell is about 1/8 of the crop). Label it "where the CNN looks", not "what".
 - **Cost:** about 1–2 s (8 rotated or flipped CNN passes).
 - **Pair it with `explain()`** on a scalar + radial model for the named, pixel-level view.
+
+## Collections drop-down: Khalifa and SWRI (19 Nov 2026)
+
+New backend module **`collections_core.py`** and key file **`SWRI_Key.csv`**, transcribed from SWRI's 2018 / 2020 / different-years tables. Josh wants a **collection drop-down** in the Gallery and the app:
+
+| id | Menu title | Folder (below "4. Whisky Webs") | Grouped by |
+|---|---|---|---|
+| `khalifa` | Khalifa samples | `Khalifa Samples` | letter folder (as now) |
+| `swri_normal` | SWRI · Normal (DFK) | `SWRI_Samples/Normal/DFK` | product |
+| `swri_years` | SWRI · Different years | `SWRI_Samples/Different_Years` | product (2022 / 2024 / 2026 bottles together) |
+| `swri_counterfeit` | SWRI · Counterfeit | `SWRI_Samples/Counterfeit` | sample number (there's no key) |
+| `swri_genuine` | SWRI · all genuine (by product) | Normal + Different years | product |
+
+**Drop-in replacement for the current scan.** Same return shape as `identify_core.scan_classes`:
+```python
+import collections_core as cc
+opts = cc.available_collections(folder)          # [(id, title, path)]: only those that exist; `folder` = the
+                                                 # Khalifa folder the app remembers, or anything inside "4. Whisky Webs"
+classes, unstitched = cc.scan_collection(cid, folder, fresh=False, include_unmapped=False)
+names = cc.collection_names(cid, folder)         # {label: display name}
+cc.label_name(label, names)                      # display name; also handles "counterfeit:S25-0227"
+cc.image_caption(path)                           # thumbnail caption: "S20-0027 · 1 µL" (+ year in Different years)
+cc.image_info(path)                              # dict: collection, sample_number, written_as, volume, year, product,
+                                                 # product_id, category (Blend / Single Malt…), set, source_folder, note
+```
+- **Labels** for SWRI are product ids (`laphroaig10`, `jw_black`…), sorted A–Z by display name. Use `names` and `label_name` for headers and the nav bar, not the raw label. `idc.code_order` isn't needed for SWRI.
+- **Scans** take about 4 s on J: and are cached for 10 min (`fresh=True` to rescan). Run them in the loader thread as the Gallery does now. `_file_stats` are filled, so `cached_thumb` stays fast.
+- **DFK only:** `Normal/Thor` and `Normal/Old` are always excluded (Josh, 19 Nov).
+- **Typo corrections are applied** (confirmed by Josh): Orange/Pink `S20-xxxx` files are 2018 samples `S18-xxxx`; `S22-1934`→`S22-1954` and `S22-2139`→`S22-2149`. `image_info()["written_as"]` keeps the file's own number, and `note` says so. Worth showing in a tooltip.
+- **Unmapped:** 6 sample numbers (11 droplets, in Blue 2 / Light Blue 2) aren't in any key and are hidden by default. `include_unmapped=True` shows them under "Not in the SWRI key".
+- **Gallery move/remove:** `move_to_removed`/`stitch_source` should work unchanged, since SWRI stitches sit in `<colour folder>/Stitched/` like Khalifa's. The colour folder is the stitch source, **not** the product label. After a move, call `scan_collection(..., fresh=True)`, because `idc.forget_images` only knows the Khalifa cache.
+- **Identify / ML tabs:** to train or match on an SWRI collection, use `scan_collection` in place of `idc.scan_classes(folder)` (in `build_database`, or `ml_core.build_dataset`). The backend can add a `collection=` parameter to `ml_core.build_dataset` on request.
+- **Suggested UI:**
+  - A drop-down at the top of the Gallery (and of Identify/ML if useful), listing `available_collections()` and defaulting to Khalifa.
+  - Optional filter chips for volume (0.5 / 1 µL) and, in Different years, year. Both come from `image_info`.
+  - The caption under each thumbnail from `image_caption`.

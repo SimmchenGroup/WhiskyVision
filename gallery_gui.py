@@ -32,6 +32,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+import collections_core as cc
 import identify_core as idc
 import stitcher_core as core
 
@@ -55,6 +56,20 @@ folder. Raw tiles are never shown, and a whisky folder with no stitched
 images yet is listed as "not stitched yet" at the top.
 
 Click a whisky in the list on the left to jump to it.
+
+COLLECTIONS
+
+The menu next to "Gallery" switches between image collections:
+  Khalifa samples            the reference folder, one folder per whisky
+  SWRI · Normal (DFK)        grouped by product
+  SWRI · Different years     grouped by product (all years together)
+  SWRI · Counterfeit         grouped by sample number (there's no key)
+  SWRI · all genuine         Normal + Different years, by product
+SWRI captions show the sample number and droplet volume (and the year where
+it matters). Use the volume / year buttons above the list to narrow it down.
+Point at a picture to see its product, category, year and source folder at
+the bottom; "file says …" means a typo in the file name was corrected. Only
+DFK images are used (Thor and Old are left out).
 
 Click a picture to open it full size in your usual image viewer. Type in
 the filter box to find a whisky or file name, and use Small / Medium /
@@ -214,6 +229,16 @@ class GalleryTab:
         self.select_mode = False
         self.selected = set()        # paths ticked in Select mode
         self._anchor = None          # last ticked path, for Shift-click ranges
+        # collections (collections_core): Khalifa = the Identify tab's folder; SWRI by product
+        self.collection = app.settings.get("gallery_collection", "khalifa")
+        self.coll_options = []       # [(id, title, path)]
+        self.names = {}              # SWRI label -> display name
+        self.info = {}               # SWRI path -> cc.image_info
+        self.captions = {}           # SWRI path -> caption under the thumbnail
+        self.loading = False
+        self.volume = tk.StringVar(value="All")
+        self.year = tk.StringVar(value="All")
+        self._note_text = ""
         self._build()
         threading.Thread(target=self._loader, daemon=True).start()
 
@@ -228,7 +253,16 @@ class GalleryTab:
         head.grid_columnconfigure(2, weight=1)
         ctk.CTkLabel(head, text="Gallery", font=F.head(30), text_color=C["accent"]).grid(
             row=0, column=0, padx=(4, 14))
-        self.summary = ctk.CTkLabel(head, text="", font=F.body(15), text_color=C["soft"], anchor="w")
+        left = ctk.CTkFrame(head, fg_color="transparent")
+        left.grid(row=0, column=1, columnspan=2, sticky="ew")
+        left.grid_columnconfigure(1, weight=1)
+        self.coll_menu = ctk.CTkOptionMenu(
+            left, values=["Khalifa samples"], command=self._on_collection, width=250, height=34,
+            corner_radius=17, font=F.semi(13), dropdown_font=F.body(13), fg_color=C["surface"],
+            button_color=C["surface"], button_hover_color=C["hover_tint"], text_color=C["text"],
+            dropdown_fg_color=C["bg"], dropdown_text_color=C["text"], dropdown_hover_color=C["hover_tint"])
+        self.coll_menu.grid(row=0, column=0, padx=(0, 14))
+        self.summary = ctk.CTkLabel(left, text="", font=F.body(15), text_color=C["soft"], anchor="w")
         self.summary.grid(row=0, column=1, sticky="w")
         self.search = search = ctk.CTkEntry(head, width=220, height=34, corner_radius=17,
                                             border_width=1, border_color=C["line"], fg_color=C["bg"],
@@ -266,14 +300,26 @@ class GalleryTab:
         nav = ctk.CTkFrame(self.body, fg_color=C["surface"], corner_radius=28, width=300)
         nav.grid(row=1, column=0, sticky="nsw", padx=(0, 16))
         nav.grid_propagate(False)
-        nav.grid_rowconfigure(1, weight=1)
+        nav.grid_rowconfigure(2, weight=1)
         nav.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(nav, text="Whiskies", font=F.semi(15), text_color=C["text"], anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=20, pady=(16, 6))
+        self.nav_title = ctk.CTkLabel(nav, text="Whiskies", font=F.semi(15), text_color=C["text"], anchor="w")
+        self.nav_title.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 6))
+        # volume / year filters, SWRI collections only
+        self.filters = filt = ctk.CTkFrame(nav, fg_color="transparent")
+        filt.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        seg = dict(font=F.body(12), height=28, corner_radius=14, fg_color=C["bg"], selected_color=C["accent"],
+                   selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
+                   unselected_hover_color=C["hover_tint"], text_color=C["text"],
+                   command=lambda v: self._schedule_layout(0))
+        self.vol_seg = ctk.CTkSegmentedButton(filt, values=["All", "0.5 µL", "1 µL"], variable=self.volume, **seg)
+        self.vol_seg.grid(row=0, column=0, sticky="w")
+        self.year_seg = ctk.CTkSegmentedButton(filt, values=["All"], variable=self.year, **seg)
+        self.year_seg.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        filt.grid_remove()
         self.nav_list = ctk.CTkScrollableFrame(nav, fg_color=C["surface"], corner_radius=0,
                                                scrollbar_button_color=C["line"],
                                                scrollbar_button_hover_color=C["muted"])
-        self.nav_list.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 16))
+        self.nav_list.grid(row=2, column=0, sticky="nsew", padx=(8, 4), pady=(0, 16))
         self.nav_list.grid_columnconfigure(0, weight=1)
 
         # -- thumbnails
@@ -317,7 +363,7 @@ class GalleryTab:
         self.body.grid_remove()
 
     def settings(self):
-        return dict(gallery_size=self.size.get())
+        return dict(gallery_size=self.size.get(), gallery_collection=self.collection)
 
     def log(self, msg):
         self.app.logs.append(msg)
@@ -332,24 +378,80 @@ class GalleryTab:
         if self.folder() != before:
             self.refresh(force=True)
 
+    def swri(self):
+        return self.collection != "khalifa"
+
+    def collection_root(self):
+        """The folder the current collection lives in (also where "_removed" goes)."""
+        if not self.swri():
+            return self.folder()
+        return next((p for c, _, p in self.coll_options if c == self.collection),
+                    cc.collection_path(self.collection, self.folder()))
+
+    def _on_collection(self, title):
+        cid = next((c for c, t, _ in self.coll_options if t == title), "khalifa")
+        if cid == self.collection:
+            return
+        self.collection = cid
+        self.volume.set("All")
+        self.year.set("All")
+        if self.search.get():
+            self.search.delete(0, "end")
+            if hasattr(self.search, "_activate_placeholder"):   # CTk drops the hint after delete()
+                self.search._activate_placeholder()
+        if self.select_mode:
+            self.toggle_select()
+        self.app._save_settings()
+        self.refresh()
+
     def refresh(self, force=False):
+        """Scan the current collection in the background (SWRI scans take seconds on J:)."""
         folder = self.folder()
-        if not force and folder == self.shown_folder:
+        key = (self.collection, folder)
+        if not force and key == self.shown_folder:
             self._schedule_layout(0)
             return
-        self.shown_folder = folder
+        self.shown_folder = key
         self.generation += 1
+        gen, cid = self.generation, self.collection
         self.queued.clear()
         if force:
             self.thumbs.clear()
             self.photos.clear()
         self.groups, self.unstitched = [], []
-        if folder and os.path.isdir(folder):
-            try:
-                self.groups, self.unstitched = collect(folder, fresh=force)
-            except OSError as e:
-                self.summary.configure(text=f"Couldn't read the folder: {e}")
+        self.loading = bool(folder and os.path.isdir(folder))
         self._schedule_layout(0)
+        if not self.loading:
+            return
+
+        def work():
+            try:
+                opts = cc.available_collections(folder) if os.path.isfile(cc.SWRI_KEY) else []
+                if cid == "khalifa" or cid not in [c for c, _, _ in opts]:
+                    groups, unstitched = collect(folder, fresh=force)
+                    names, info, caps, cid_used = {}, {}, {}, "khalifa"
+                else:
+                    groups, unstitched = cc.scan_collection(cid, folder, fresh=force)
+                    names = cc.collection_names(cid, folder)
+                    info = {p: cc.image_info(p) for _, ps in groups for p in ps}
+                    caps = {p: cc.image_caption(p) for p in info}
+                    cid_used = cid
+                self.app.events.put(("gal_groups", (gen, cid_used, opts, groups, unstitched, names, info, caps,
+                                                    None)))
+            except Exception as e:  # noqa: BLE001
+                self.app.events.put(("gal_groups", (gen, cid, [], [], [], {}, {}, {}, str(e))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_options(self, opts):
+        """Fill the collection menu. The Khalifa entry is always the Identify tab's folder."""
+        folder = self.folder()
+        base = os.path.basename(os.path.normpath(folder)) if folder else ""
+        k_title = "Khalifa samples" if base.lower() == "khalifa samples" or not base else f"Reference: {base}"
+        if not os.path.isfile(cc.SWRI_KEY):     # SWRI_Key.csv isn't in the repo: no SWRI collections
+            opts = []
+        self.coll_options = [("khalifa", k_title, folder)] + [o for o in opts if o[0] != "khalifa"]
+        self.coll_menu.configure(values=[t for _, t, _ in self.coll_options])
+        self.coll_menu.set(next(t for c, t, _ in self.coll_options if c == self.collection))
 
     # ------------------------------------------------------------- loading
     def _loader(self):
@@ -373,6 +475,35 @@ class GalleryTab:
             self.app.events.put(("gal_thumb", (gen, path, im, disp, px)))
 
     def handle(self, kind, data):
+        if kind == "gal_groups":
+            gen, cid, opts, groups, unstitched, names, info, caps, err = data
+            if gen != self.generation:
+                return
+            self.loading = False
+            if err:
+                self.summary.configure(text=f"Couldn't read the folder: {err}")
+                self._schedule_layout(0)
+                return
+            self.collection = cid
+            self._set_options(opts)
+            self.groups, self.unstitched = groups, unstitched
+            self.names, self.info, self.captions = names, info, caps
+            noun = {"swri_counterfeit": "Samples"}.get(cid, "Products" if self.swri() else "Whiskies")
+            self.nav_title.configure(text=noun)
+            if self.swri():
+                years = sorted({i.get("year", "") for i in info.values()} - {""})
+                self.year_seg.configure(values=["All"] + years)
+                if self.year.get() not in ["All"] + years:
+                    self.year.set("All")
+                if len(years) > 1:
+                    self.year_seg.grid()
+                else:
+                    self.year_seg.grid_remove()
+                self.filters.grid()
+            else:
+                self.filters.grid_remove()
+            self._schedule_layout(0)
+            return
         if kind == "gal_thumb":
             gen, path, im, disp, px = data
             self.thumbs[path] = im
@@ -393,8 +524,9 @@ class GalleryTab:
             w.destroy()
         self.nav_buttons, self.nav_active = {}, None
         total = sum(n for _, _, n in sig)
-        for row, (code, name, n) in enumerate([("", "All whiskies", total)] + list(sig)):
-            label = self.identify.whisky_full(code) if code else name
+        everything = "All" if self.swri() else "All whiskies"
+        for row, (code, name, n) in enumerate([("", everything, total)] + list(sig)):
+            label = _ellipsize(self._nav_label(code) if code else name, 236, 7.4)
             b = ctk.CTkButton(self.nav_list, text=label, anchor="w", height=34, corner_radius=17,
                               fg_color="transparent", hover_color=self.C["hover_tint"],
                               text_color=self.C["text"], font=self.F.body(13),
@@ -454,15 +586,51 @@ class GalleryTab:
             self._layout()
         self._layout_job = self.app.after(delay, go)
 
+    # ------------------------------------------------------------- names
+    def _name(self, code):
+        """Section heading: whisky name (Khalifa) or product / counterfeit sample (SWRI)."""
+        if not self.swri():
+            return self.identify.whisky(code)
+        return cc.label_name(code, self.names)
+
+    def _nav_label(self, code):
+        return self._name(code) if self.swri() else self.identify.whisky_full(code)
+
+    def _section_note(self, code, paths):
+        n = f"{len(paths)} image{'s' if len(paths) != 1 else ''}"
+        if not self.swri():
+            return f"{self.identify.code(code)} · {n}"
+        inf = [self.info.get(p, {}) for p in paths]
+        bits = [inf[0].get("category", "")] if inf and self.collection != "swri_counterfeit" else []
+        nums = {i.get("sample_number") for i in inf} - {None}
+        if self.collection != "swri_counterfeit" and nums:
+            bits.append(f"{len(nums)} sample{'s' if len(nums) != 1 else ''}")
+        return " · ".join(b for b in bits + [n] if b)
+
+    def caption(self, path):
+        if self.swri():
+            return self.captions.get(path) or os.path.basename(path)
+        return os.path.splitext(os.path.basename(path))[0]
+
+    def _passes_filters(self, path):
+        if not self.swri():
+            return True
+        i = self.info.get(path, {})
+        v, y = self.volume.get(), self.year.get()
+        return (v == "All" or i.get("volume") == v) and (y == "All" or i.get("year") == y)
+
     def _visible_groups(self):
         q = self.search.get().strip().lower()
         out = []
         for code, paths in self.groups:
-            name = self.identify.whisky(code)
+            paths = [p for p in paths if self._passes_filters(p)]
+            if not paths:
+                continue
+            name = self._name(code)
             if not q or q in code.lower() or q in name.lower():
                 out.append((code, name, paths))
             else:
-                hits = [p for p in paths if q in os.path.basename(p).lower()]
+                hits = [p for p in paths if q in os.path.basename(p).lower() or q in self.caption(p).lower()]
                 if hits:
                     out.append((code, name, hits))
         return out
@@ -495,21 +663,35 @@ class GalleryTab:
         if not os.path.isdir(folder):
             self.summary.configure(text="")
             return message(f"This folder doesn't exist:\n{folder}")
+        if self.loading:
+            self.summary.configure(text="Loading…")
+            return message("Finding the stitched images…" + ("\n\nThe first SWRI scan takes a few seconds."
+                                                            if self.swri() else ""))
         groups = self._visible_groups()
         n = sum(len(p) for _, _, p in groups)
         total = sum(len(p) for _, p in self.groups)
-        text = (f"{n} of {total} images" if n != total else f"{total} images") \
-            + f" · {len(groups)} whisk{'y' if len(groups) == 1 else 'ies'}"
-        if self.unstitched:
-            text += f" · not stitched yet: {', '.join(self.unstitched)}"
-        self.summary.configure(text=text)
-        shown = folder if len(folder) <= 90 else "…" + folder[-89:]
-        if self.select_mode:
-            self.note.configure(text=f"{shown}   ·   Click pictures to select them (Shift-click for a "
-                                     f"range), then press Remove selected.")
+        if self.collection == "swri_counterfeit":
+            noun = ("sample", "samples")
+        elif self.swri():
+            noun = ("product", "products")
         else:
-            self.note.configure(text=f"{shown}   ·   Click a picture to open it full size, ✕ or right-click "
-                                     f"to remove it from the dataset.")
+            noun = ("whisky", "whiskies")
+        text = (f"{n} of {total} images" if n != total else f"{total} images") \
+            + f" · {len(groups)} {noun[0] if len(groups) == 1 else noun[1]}"
+        if self.unstitched:
+            shown_u = self.unstitched[:6]
+            text += f" · not stitched yet: {', '.join(shown_u)}" + (" …" if len(self.unstitched) > 6 else "")
+        self.summary.configure(text=text)
+        root = self.collection_root()
+        shown = root if len(root) <= 90 else "…" + root[-89:]
+        if self.select_mode:
+            self._note_text = (f"{shown}   ·   Click pictures to select them (Shift-click for a "
+                               f"range), then press Remove selected.")
+        else:
+            self._note_text = (f"{shown}   ·   Click a picture to open it full size, ✕ or right-click "
+                               f"to remove it from the dataset."
+                               + ("  Point at one for its details." if self.swri() else ""))
+        self.note.configure(text=self._note_text)
         if not groups:
             return message("No images here." if not self.groups else "Nothing matches the filter.")
         self._build_nav(groups)
@@ -521,7 +703,7 @@ class GalleryTab:
             self.group_y.append((y, code))
             cv.create_text(MARGIN / 2, y + 18, anchor="w", text=name, fill=C["text"],
                            font=(self.F.head_family, 16))
-            sub = f"{self.identify.code(code)} · {len(paths)} image{'s' if len(paths) != 1 else ''}"
+            sub = self._section_note(code, paths)
             cv.create_text(MARGIN / 2 + tkfont_width(self.F.head_family, 16, name, cv) + 14, y + 19,
                            anchor="w", text=sub, fill=C["muted"], font=(self.F.body_family, 11))
             y += HEAD_H
@@ -582,7 +764,7 @@ class GalleryTab:
         cv.create_rectangle(x0, y0, x0 + px, y0 + px, fill=C["well"], outline=C["well"],
                             width=2, tags=(tag, tag + "box"))
         self.items[path] = (cv.create_image(x0 + px / 2, y0 + px / 2, tags=(tag,)), tag)
-        label = os.path.splitext(os.path.basename(path))[0]
+        label = self.caption(path)
         cv.create_text(x0 + px / 2, y0 + px + 13, text=_ellipsize(label, px, 7),
                        fill=C["soft"], font=(self.F.body_family, 10), tags=(tag,))
         if self.select_mode:                  # selection tick
@@ -641,6 +823,22 @@ class GalleryTab:
                 cv.create_text(bx, by, text="✕", fill=C["bg"], font=(self.F.body_family, 10),
                                tags=("hoverx",))
         cv.configure(cursor="hand2" if tag else "")
+        if self.swri():                       # details of the picture under the mouse
+            t = self.tile_by_tag.get(tag) if tag else None
+            self.note.configure(text=self._details(t[4]) if t else self._note_text,
+                                text_color=C["text"] if t else C["muted"])
+
+    def _details(self, path):
+        i = self.info.get(path) or cc.image_info(path)
+        num = i.get("sample_number", "")
+        if i.get("written_as") and i.get("written_as") != num:
+            num += f" (file says {i['written_as']})"
+        bits = [num, i.get("product", ""), i.get("category", ""), i.get("volume", ""), i.get("year", ""),
+                f"folder {i.get('source_folder', '')}"]
+        note = i.get("note", "")
+        if note and "file says" not in note:
+            bits.append(note)
+        return "   ·   ".join(b for b in bits if b) + f"   ·   {os.path.basename(path)}"
 
     def _on_motion(self, e):
         t, _ = self._tile_at(e)
@@ -759,12 +957,12 @@ class GalleryTab:
     # ----------------------------------------------------------- remove
     def remove(self, path):
         """Move an image out of the dataset and queue its sample to be stitched again."""
-        root = self.folder()
+        root = self.collection_root()
         if not path or not os.path.exists(path):
             return
         source = stitch_source(path, [self.app.folder.get()])
         text = (f"Remove {os.path.basename(path)} from the dataset?\n\n"
-                f"It's moved to the \"{REMOVED_DIR}\" folder inside the reference folder, not deleted, "
+                f"It's moved to the \"{REMOVED_DIR}\" folder inside {os.path.basename(root)}, not deleted, "
                 f"so you can put it back. The Gallery and Identify tabs ignore that folder.")
         if source:
             text += (f"\n\nIts tiles were found, so sample \"{source[1]}\" will be marked Redo on the "
@@ -781,10 +979,7 @@ class GalleryTab:
         self.log(f"Removed {os.path.relpath(path, root)} from the dataset (moved to {dest})")
         self.thumbs.pop(path, None)
         self.photos.pop(path, None)
-        idc.forget_images(root, [path])       # update the cached scan instead of re-reading
-        self.shown_folder = None
-        self.refresh()
-        self.identify._scan_database(quiet=True)
+        self._forget([path])
         if source:
             if self.app.mark_redo(*source):
                 self.app.status_label.configure(text=f"\"{source[1]}\" is marked Redo – press Stitch to redo it")
@@ -793,16 +988,31 @@ class GalleryTab:
                                                       f"marked Redo yet. Open {source[0]} on the Stitch tab "
                                                       "and stitch it again.")
 
+    def _forget(self, paths):
+        """Images were moved out: update the cached scans instead of re-reading the folders."""
+        if self.swri():
+            gone = set(paths)
+            self.groups = [(c, [p for p in ps if p not in gone]) for c, ps in self.groups]
+            self.groups = [(c, ps) for c, ps in self.groups if ps]
+            with cc._lock:
+                cc._scan_cache.clear()           # every SWRI collection may hold these images
+            self._schedule_layout(0)
+            return
+        idc.forget_images(self.folder(), paths)
+        self.shown_folder = None
+        self.refresh()
+        self.identify._scan_database(quiet=True)
+
     def remove_selected(self):
         """Move every selected image out of the dataset in one go."""
-        root = self.folder()
+        root = self.collection_root()
         paths = [p for p in self.selected if os.path.exists(p)]
         if not paths:
             return
         n = len(paths)
         hidden = len(set(paths) - set(self._visible_paths()))
         text = (f"Remove {n} image{'s' if n != 1 else ''} from the dataset?\n\n"
-                f"They're moved to the \"{REMOVED_DIR}\" folder inside the reference folder, not deleted, "
+                f"They're moved to the \"{REMOVED_DIR}\" folder inside {os.path.basename(root)}, not deleted, "
                 f"so you can put them back. The Gallery and Identify tabs ignore that folder.")
         if hidden:
             text += f"\n\n{hidden} of them are hidden by the current filter."
@@ -830,12 +1040,9 @@ class GalleryTab:
         moved = n - len(failed)
         self.log(f"Removed {moved} image{'s' if moved != 1 else ''} from the dataset "
                  f"(moved to {os.path.join(root, REMOVED_DIR)})")
-        idc.forget_images(root, moved_paths)  # update the cached scan instead of re-reading
         self.selected.clear()
         self._anchor = None
-        self.shown_folder = None
-        self.refresh()
-        self.identify._scan_database(quiet=True)
+        self._forget(moved_paths)
 
         # Mark Redo for the tiles that were found. The Stitch tab shows one folder at a time,
         # so use the one already open there if it has any, otherwise the most common one.
