@@ -35,6 +35,10 @@ VIEWS = ["Raw", "Rim", "Ring map", "Background", "Subtracted", "Normalised", "Un
 FIG_ROWS = 6                 # per-droplet figures get one row per image
 DROPLET_CACHE = 24           # analysed droplets kept in memory (Explore)
 SETS = ["scalar", "radial", "scalar+radial"]
+CNN_NOTE = ("EfficientNet-B0, used only to describe each droplet (not trained). "
+            "First run re-reads every image, then it's cached.")
+CNN_MISSING = "Needs PyTorch (about 1 GB, CPU version). Install it once with the link above."
+TORCH_INDEX = "https://download.pytorch.org/whl/cpu"
 
 HELP_TEXT = """\
 ML: DROPLET FEATURES AND A TRAINED CLASSIFIER
@@ -81,7 +85,9 @@ Pretrained CNN sets (need PyTorch): a ready-made image network
 (EfficientNet-B0, trained on ordinary photos) describes each droplet with
 1,280 numbers; the same quick classifier is trained on those. The network
 itself is never trained here. The first CNN run re-reads every image
-(about as long as the first "Load dataset"), then it's cached.
+(about as long as the first "Load dataset"), then it's cached. If PyTorch
+isn't installed, use "Install PyTorch…" next to the CNN buttons: it installs
+the CPU version (about 1 GB) into the Python this app runs on.
 Scores are WITHIN-SLIP: all droplets of a whisky are on one cover slip, so
 they mean "recognises another droplet from the same slip", not a guarantee
 for a new slip.
@@ -1045,17 +1051,23 @@ class MLTab:
         ctk.CTkLabel(grid, text="Pretrained CNN", font=F.body(13), text_color=C["muted"]).grid(
             row=1, column=0, sticky="w")
         cnn_problem = mc.cnn_available()
-        ctk.CTkSegmentedButton(grid, values=list(mc.CNN_SETS), variable=self.feature_set, font=F.body(12),
-                               height=30, corner_radius=15, fg_color=C["bg"], selected_color=C["accent"],
-                               selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
-                               unselected_hover_color=C["hover_tint"], text_color=C["text"],
-                               state="disabled" if cnn_problem else "normal").grid(
-            row=1, column=1, sticky="w", padx=(12, 0), pady=3)
-        ctk.CTkLabel(grid, text=("Needs PyTorch: pip install torch torchvision" if cnn_problem else
-                                 "EfficientNet-B0, used only to describe each droplet (not trained). "
-                                 "First run re-reads every image, then it's cached."),
-                     font=F.body(11), text_color=C["muted"], anchor="w", justify="left", wraplength=290).grid(
-            row=2, column=1, sticky="w", padx=(12, 0))
+        cnn_row = ctk.CTkFrame(grid, fg_color="transparent")
+        cnn_row.grid(row=1, column=1, sticky="w", padx=(12, 0), pady=3)
+        self.cnn_seg = ctk.CTkSegmentedButton(
+            cnn_row, values=list(mc.CNN_SETS), variable=self.feature_set, font=F.body(12),
+            height=30, corner_radius=15, fg_color=C["bg"], selected_color=C["accent"],
+            selected_hover_color=C["accent_hover"], unselected_color=C["bg"],
+            unselected_hover_color=C["hover_tint"], text_color=C["text"],
+            state="disabled" if cnn_problem else "normal")
+        self.cnn_seg.pack(side="left")
+        self.cnn_install = None
+        if cnn_problem:
+            self.cnn_install = self.app._link(cnn_row, "Install PyTorch…", self.install_torch, 12)
+            self.cnn_install.pack(side="left", padx=(10, 0))
+        self.cnn_note = ctk.CTkLabel(
+            grid, text=(CNN_MISSING if cnn_problem else CNN_NOTE), font=F.body(11), text_color=C["muted"],
+            anchor="w", justify="left", wraplength=290)
+        self.cnn_note.grid(row=2, column=1, sticky="w", padx=(12, 0))
         ctk.CTkCheckBox(grid, text="Normalised (ignores exposure and lamp colour; usually a few points lower)",
                         variable=self.normalised, font=F.body(12), text_color=C["text"], fg_color=C["accent"],
                         hover_color=C["accent_hover"], border_color=C["line"], checkbox_width=18,
@@ -1236,6 +1248,58 @@ class MLTab:
             return
         runs = list(self.cv_runs[-12:])
         self._figure("Cross-validation runs compared", lambda: mc.figure_cv_comparison(runs), "cv_runs.png")
+
+    def install_torch(self):
+        """pip-install the CPU build of PyTorch into the Python running this app (so it
+        lands in the right place even when the PC has several Pythons)."""
+        import subprocess
+        import sys
+        py = sys.executable
+        if os.path.basename(py).lower() == "pythonw.exe":           # pip wants the console one
+            cand = os.path.join(os.path.dirname(py), "python.exe")
+            py = cand if os.path.exists(cand) else py
+        if not messagebox.askyesno(
+                self.app.title(),
+                "Install PyTorch for the CNN feature sets?\n\n"
+                f"Downloads about 1 GB (CPU version) and installs it into:\n{py}\n\n"
+                "Takes a few minutes. The rest of the app keeps working meanwhile."):
+            return
+        cmd = [py, "-m", "pip", "install", "torch", "torchvision", "--index-url", TORCH_INDEX]
+        if not (sys.prefix != sys.base_prefix or os.path.exists(os.path.join(sys.prefix, "conda-meta"))):
+            cmd.insert(4, "--user")                    # plain installs (e.g. Program Files) need --user
+
+        def work():
+            self._bg_log("$ " + " ".join(cmd))
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            for line in p.stdout:
+                if self.stop_flag.is_set():
+                    p.kill()
+                    raise InterruptedError("stopped")
+                line = line.rstrip()
+                if line and "[notice]" not in line:
+                    self._bg_log("  " + line)
+                    if line.startswith(("Collecting", "Downloading", "Installing", "Successfully")):
+                        self.app.events.put(("ml_status", line[:110]))
+            if p.wait() != 0:
+                raise RuntimeError("pip failed; see Show log for the details")
+            import importlib
+            importlib.invalidate_caches()
+            return mc.cnn_available()
+
+        def done(problem):
+            if problem:                                 # installed, but this process can't import it yet
+                messagebox.showinfo(self.app.title(), "PyTorch is installed. Close and reopen the app "
+                                                      "to use the CNN feature sets.")
+                return
+            self.cnn_seg.configure(state="normal")
+            self.cnn_note.configure(text=CNN_NOTE)
+            if self.cnn_install is not None:
+                self.cnn_install.destroy()
+                self.cnn_install = None
+            self.log("PyTorch installed: the CNN feature sets are ready.")
+            messagebox.showinfo(self.app.title(), "PyTorch is installed. The CNN feature sets are ready.")
+        self._run("Installing PyTorch (about 1 GB)…", work, done)
 
     def training_curves(self):
         """PCA, loss and accuracy per step, and the features used, for one training run."""
