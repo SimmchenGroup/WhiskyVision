@@ -1,0 +1,9 @@
+# Research scripts in ml/ (the app itself only needs ../requirements.txt):
+#   pip install -r ml/requirements.txt
+# For a smaller CPU-only PyTorch (about 1 GB instead of several), install it first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+-r ../requirements.txt
+pandas
+scikit-learn
+torch
+torchvision
