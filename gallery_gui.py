@@ -75,6 +75,17 @@ Click a picture to open it full size in your usual image viewer. Type in
 the filter box to find a whisky or file name, and use Small / Medium /
 Large to change the picture size.
 
+RESTITCHING AN IMAGE
+
+Right-click a picture and choose "Restitch…". The window finds the tiles it
+was stitched from (the folder above its "Stitched" folder, or the folder open
+on the Stitch tab) and shows the tile layout, the current image and a quick
+preview of the new stitch side by side. Change rows, columns, order, overlap
+or refine until the preview looks right, then press "Stitch & replace": it's
+stitched again at full size with the Python engine. The old image is kept in
+Stitched/_replaced unless you untick that, and the sample's Redo mark (if
+any) is cleared.
+
 REMOVING A BAD IMAGE
 
 Point at a picture and click its ✕ (or right-click it) to remove it from
@@ -349,6 +360,7 @@ class GalleryTab:
         self.menu_path = None
         self.menu.add_command(label="Open", command=lambda: self._open(self.menu_path))
         self.menu.add_command(label="Show in folder", command=lambda: show_in_folder(self.menu_path))
+        self.menu.add_command(label="Restitch…", command=lambda: self.restitch(self.menu_path))
         self.menu.add_separator()
         self.menu.add_command(label="Remove from dataset…", command=lambda: self.remove(self.menu_path))
 
@@ -953,6 +965,27 @@ class GalleryTab:
             open_file(path)
         except OSError as e:
             messagebox.showerror(self.app.title(), f"Couldn't open the image:\n{e}")
+
+    # ----------------------------------------------------------- restitch
+    def restitch(self, path):
+        """Open the Restitch window for one image (finds its tiles, stitches it again)."""
+        if not path or not os.path.exists(path):
+            return
+        from restitch_dialog import RestitchDialog
+        RestitchDialog(self.app, self.C, path, on_done=self._restitched)
+
+    def _restitched(self, old, new):
+        """A picture was stitched again: show the new image (same place in the list)."""
+        for p in {old, new}:
+            self.thumbs.pop(p, None)
+            self.photos.pop(p, None)
+            self.queued.discard(p)
+        if os.path.normcase(old) != os.path.normcase(new):
+            self.groups = [(c, [new if p == old else p for p in ps]) for c, ps in self.groups]
+            if old in self.info:
+                self.info[new] = self.info.pop(old)
+                self.captions[new] = self.captions.pop(old, self.caption(new))
+        self._schedule_layout(0)
 
     # ----------------------------------------------------------- remove
     def remove(self, path):
