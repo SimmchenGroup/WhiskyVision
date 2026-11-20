@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 # generated macro with local data paths
 legacy/stitch_macro.ijm
+# SWRI sample key: partner data, not for the public repo (share it privately;
+# collections_core.py looks for it next to itself)
+SWRI_Key.csv
