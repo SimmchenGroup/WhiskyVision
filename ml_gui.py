@@ -10,6 +10,8 @@ Four pages, picked at the top of the tab:
                    cross-validation, control (nuisance) run, feature-set comparison,
                    train & save a model
   Predict          load a model, add images, per-droplet results and a sample verdict
+  Explain          what the model uses: evidence heat maps / CNN maps for one image,
+                   or averaged over a whole sample (ml_explain_gui.py)
 
 Everything heavier than drawing a view runs in one background thread (self._run);
 results come back through the app's event queue as ("ml_…", data) events.
@@ -30,7 +32,7 @@ from PIL import Image, ImageTk
 import identify_core as idc
 import ml_core as mc
 
-PAGES = ["Explore", "Sample average", "Train & evaluate", "Predict"]
+PAGES = ["Explore", "Sample average", "Train & evaluate", "Predict", "Explain"]
 VIEWS = ["Raw", "Rim", "Ring map", "Background", "Subtracted", "Normalised", "Unwrap", "Crop"]
 FIG_ROWS = 6                 # per-droplet figures get one row per image
 DROPLET_CACHE = 24           # analysed droplets kept in memory (Explore)
@@ -98,7 +100,31 @@ Tick "These images are one sample" when they are droplets of the same
 sample: they are judged together, which is far more reliable (and is the
 only good check for "not like any trained whisky"). A model always names one
 of the whiskies it was trained on; a close relative can be called as its
-sibling. "Save results" writes a CSV."""
+sibling. "Save results" writes a CSV. "Explain…" sends the images to the
+Explain page.
+
+EXPLAIN: WHAT THE MODEL USES
+Uses the model loaded on Predict. Two modes:
+  Selected image   add images, click one, press Explain
+  Whole sample     pick a sample (Khalifa or an SWRI collection), press
+                   "Explain sample": the evidence is averaged over its
+                   droplets (a random 10 / 20 / 40, or all; 2–4 s each)
+"Explain" picks the whisky to explain (default: the prediction, or the
+sample's own whisky) and "versus" what to compare it with (the average of
+the other whiskies, the runner-up, or any whisky).
+Views:
+  Evidence   red = pixels pushing the score towards the whisky, blue = away
+  For / Against   the feature groups adding / taking away most, one colour
+             each, matching the bars below
+  CNN map    for CNN models: where the CNN evidence sits (8 × 8 cells, so
+             "where it looks", not "what it sees")
+  Spread     (whole sample) how much the evidence varies between droplets
+The bars rank the feature groups (rim colour, interior particles, …) in
+logit units: +2.3 multiplies the odds by about 10. The band plot shows the
+evidence in each ring from the centre (0) to the rim (1) and beyond; the
+bands add up to the score. Droplets are randomly rotated, so averages are
+ring-shaped and the band plot is the clearest summary. "Figure" makes a
+figure of the selected images, or one row per sample explained so far."""
 
 
 def fit_to(im, w, h):
@@ -365,7 +391,8 @@ class MLTab:
 
     def settings(self):
         return dict(ml_page=self.page.get(), ml_feature_set=self.feature_set.get(),
-                    ml_normalised=bool(self.normalised.get()), ml_model=self.model_path)
+                    ml_normalised=bool(self.normalised.get()), ml_model=self.model_path,
+                    **self.explain.settings())
 
     def _card(self, parent, title, badge=None):
         C, F = self.C, self.F
@@ -468,7 +495,8 @@ class MLTab:
 
         self.pages = {}
         for name, build in (("Explore", self._build_explore), ("Sample average", self._build_sample),
-                            ("Train & evaluate", self._build_train), ("Predict", self._build_predict)):
+                            ("Train & evaluate", self._build_train), ("Predict", self._build_predict),
+                            ("Explain", self._build_explain)):
             f = ctk.CTkFrame(self.body, fg_color=C["bg"], corner_radius=0)
             f.grid(row=1, column=0, sticky="nsew")
             f.grid_rowconfigure(0, weight=1)
@@ -511,7 +539,7 @@ class MLTab:
         for n, f in self.pages.items():
             f.grid() if n == name else f.grid_remove()
         folder = self.folder()
-        if name in ("Sample average", "Train & evaluate"):
+        if name in ("Sample average", "Train & evaluate", "Explain"):
             shown = folder if len(folder) <= 70 else "…" + folder[-69:]
             self.head_note.configure(text=f"Reference folder: {shown}" if folder else
                                      "Choose the reference folder on the Identify tab")
@@ -529,6 +557,8 @@ class MLTab:
             self._draw_sample()
         elif name == "Train & evaluate":
             self._draw_cv_figure()
+        elif name == "Explain":
+            self.explain.draw()
 
     # ------------------------------------------------------------- Explore
     def _build_explore(self, page):
@@ -601,6 +631,8 @@ class MLTab:
         """(values, tag) of one row of an ImageList."""
         name = os.path.splitext(os.path.basename(path))[0].replace("_stitched", "")
         label = mc.label_of(path)
+        if lst is getattr(getattr(self, "explain", None), "list", None):
+            return self.explain.row_for(path)
         if lst is self.ex_list:
             d = self.droplets.get(path)
             if path in self.failed:
@@ -1422,6 +1454,7 @@ class MLTab:
         row.pack(fill="x", padx=16, pady=(4, 16))
         self._button(row, "Predict", self.predict, primary=True, width=140).pack(side="left")
         self._button(row, "Save results (CSV)", self.save_csv).pack(side="left", padx=8)
+        self._button(row, "Explain…", self.explain_predicted).pack(side="left")
 
         right = ctk.CTkFrame(page, fg_color=C["bg"], corner_radius=0)
         right.grid(row=0, column=1, sticky="nsew")
@@ -1470,6 +1503,7 @@ class MLTab:
         lines.append("\"Unknown whisky\" check: " + ("calibrated" if info.get("unknown_threshold") else
                                                      "off (trained without cross-validation)"))
         self.model_info.configure(text="\n".join(lines), text_color=self.C["soft"])
+        self.explain.model_changed()
         if not quiet:
             self.app._save_settings()
 
@@ -1609,6 +1643,22 @@ class MLTab:
             messagebox.showerror(self.app.title(), f"Couldn't save:\n{e}")
             return
         self.log(f"Saved results to {f}")
+
+    def explain_predicted(self):
+        """Send the Predict images (the selected ones, or all) to the Explain page."""
+        paths = self.pr_list.selected() or list(self.pr_list.paths)
+        if not paths:
+            messagebox.showinfo(self.app.title(), "Add the images to explain first.")
+            return
+        self.explain.add_images(paths)
+        self.page.set("Explain")
+        self._show_page()
+
+    # ------------------------------------------------------------- Explain
+    def _build_explain(self, page):
+        from ml_explain_gui import ExplainPage
+        self.explain = ExplainPage(self, page)
+        self.explain.model_changed()
 
     # ================================================================ running
     def _run(self, label, work, done, quiet=False):

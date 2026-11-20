@@ -2102,6 +2102,8 @@ class Explanation:
     heat: np.ndarray                         # HxW signed map: sum of all contributions (+ = for target)
     image: np.ndarray                        # HxWx3 uint8 display image the maps line up with
     total: float                             # sum of contributions = logit gap explained
+    cnn_total: float = 0.0                   # combined models: the CNN embedding's share of `total`
+                                             # (not mapped here; see cnn_map). Features part = total - cnn_total
 
 
 def _pixel_geometry(d):
@@ -2218,12 +2220,17 @@ def explain(model, d, target=None, versus=None, smooth=1.5):
     whisky). versus: None = against the average of the other whiskies, or a label (e.g. the
     runner-up) for "why target rather than versus". Returns an Explanation; contributions
     are in logit units and sum exactly to the explained logit gap."""
-    if "cnn" in model.feature_set or model.feature_set == "nuisance":
-        raise ValueError("explanations cover the scalar / radial feature sets only")
+    if model.feature_set in ("cnn", "nuisance"):
+        raise ValueError("explanations cover the scalar / radial feature sets and cnn+scalar+radial "
+                         "(use cnn_map for a CNN-only model)")
     if d.seg is None:
         raise ValueError("no droplet found in this image")
     cv2 = _cv2()
     rec = record_from_droplet(d)
+    if "cnn" in model.feature_set:                     # combined: attach the (cached) embedding
+        add_embeddings([rec], (model.info or {}).get("downsample", DOWNSAMPLE), log=lambda *_: None)
+        if rec.cnn is None:
+            raise ValueError("no CNN embedding for this droplet")
     X, names = feature_matrix([rec], model.feature_set, model.normalised)
     p = model.proba(X)[0]
     order = np.argsort(-p)
@@ -2235,12 +2242,14 @@ def explain(model, d, target=None, versus=None, smooth=1.5):
     else:
         w, vs = Weff[:, ti] - Weff[:, model.classes.index(versus)], versus
     contrib = (X[0].astype(np.float64) - model.mean) / model.scale * w
+    is_cnn = np.array([n.startswith("cnn_") for n in names])
+    cnn_total = float(contrib[is_cnn].sum())
     weights = _feature_pixel_weights(d, model.normalised)
     H, Wd = d.rgb.shape[:2]
     heat = np.zeros((H, Wd), np.float64)
     gmaps, gsum = {}, {}
-    for name, c in zip(names, contrib):
-        if abs(c) < 1e-9:
+    for name, c, cn in zip(names, contrib, is_cnn):
+        if cn or abs(c) < 1e-9:                        # CNN terms have no pixel footprint here
             continue
         m = weights(name).astype(np.float64)
         s = m.sum()
@@ -2255,13 +2264,14 @@ def explain(model, d, target=None, versus=None, smooth=1.5):
         sig = max(1.0, smooth * max(H, Wd) / 300)
         heat = cv2.GaussianBlur(heat, (0, 0), sig)
         gmaps = {g: cv2.GaussianBlur(m, (0, 0), sig) for g, m in gmaps.items()}
-    feats = sorted(zip(names, contrib.tolist()), key=lambda t: -abs(t[1]))
+    feats = sorted(((n, c) for n, c, cn in zip(names, contrib.tolist(), is_cnn) if not cn),
+                   key=lambda t: -abs(t[1]))
     groups = sorted(gsum.items(), key=lambda t: -abs(t[1]))
     img = view_normalised(d) if model.normalised else view_raw(d)
     return Explanation(model.classes[ti], vs, float(p[ti]),
                        [(model.classes[i], float(p[i])) for i in order[:3]],
                        feats, groups, {g: m.astype(np.float32) for g, m in gmaps.items()},
-                       heat.astype(np.float32), img, float(contrib.sum()))
+                       heat.astype(np.float32), img, float(contrib.sum()), cnn_total)
 
 
 EXPLAIN_COLOURS = [(255, 80, 80), (80, 200, 255), (255, 210, 60), (120, 255, 120),
@@ -2324,7 +2334,9 @@ def figure_explain(explanations, names=None, k=6, dpi=150):
                       edgecolor="k", lw=0.4)
         ax[i, 4].set_yticks(ys, [g for g, _, _ in bars], fontsize=8)
         ax[i, 4].axvline(0, color="k", lw=0.6)
-        ax[i, 4].set_xlabel(f"contribution to {e.target} vs {e.versus} (logit units)", fontsize=8)
+        ax[i, 4].set_xlabel(f"contribution to {e.target} vs {e.versus} (logit units)"
+                            + (f"\nfeatures {e.total - e.cnn_total:+.2f} · CNN part {e.cnn_total:+.2f} (not mapped)"
+                               if e.cnn_total else ""), fontsize=8)
     for j, t in enumerate(["image", "evidence map (red = for, blue = against)",
                            f"top {k} feature groups FOR", f"top {k} feature groups AGAINST",
                            "ranked feature groups"]):
@@ -2408,3 +2420,240 @@ def view_cnn_map(cm, alpha=0.65):
     col = np.where(h > 0, np.array([255, 40, 30], np.float32), np.array([40, 120, 255], np.float32))
     a = alpha * np.abs(h)
     return np.clip(base * (1 - a) + col * a, 0, 255).astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+#  Average explanations over many droplets (a whole sample / whisky)
+# --------------------------------------------------------------------------- #
+# Each droplet's maps are cut out with the same droplet-centred crop as the CNN (side
+# 2.4 × mean rim radius), so every droplet lands in one common frame: centre in the
+# middle, rim on the same circle, whatever its size. Rotations are random, so the
+# average is close to radially symmetric; the radial evidence profile (evidence vs r/R)
+# is the most readable summary and is computed exactly from the per-pixel maps.
+
+AVG_SIZE = 256
+
+
+@dataclass
+class AverageExplanation:
+    target: str
+    versus: str
+    kind: str                                # "features" or "cnn"
+    n: int                                   # droplets used
+    skipped: list                            # [(name, reason)]
+    mean_image: np.ndarray                   # AVG_SIZE² × 3 uint8: the average droplet (display)
+    heat: np.ndarray                         # AVG_SIZE² signed mean evidence (+ = for target)
+    heat_sd: np.ndarray                      # AVG_SIZE² SD over droplets (how consistent)
+    radial_r: np.ndarray                     # r/R bins
+    radial: np.ndarray                       # mean evidence per unit area at r/R (+ = for target)
+    radial_sd: np.ndarray
+    groups: list                             # [(group, mean contribution, SD)] ranked by |mean|  (features only)
+    group_maps: dict                         # group -> AVG_SIZE² mean map                       (features only)
+    probability: float                       # mean probability of target over the droplets
+    accuracy: float                          # share of droplets predicted as target
+    features_part: float = 0.0               # mean (over droplets) of the mapped features' total
+    features_part_sd: float = 0.0
+    cnn_part: float = 0.0                    # combined models: mean CNN share of the score (not mapped)
+    cnn_part_sd: float = 0.0
+
+
+def _crop_map(m, seg, size=AVG_SIZE):
+    """crop() for a float map (same geometry, zero outside the image)."""
+    cv2 = _cv2()
+    half = max(2, int(1.2 * float(np.mean(seg["rim"]))))
+    big = cv2.copyMakeBorder(np.asarray(m, np.float32), half, half, half, half, cv2.BORDER_CONSTANT, value=0)
+    x0, y0 = int(seg["cx"]), int(seg["cy"])
+    c = big[y0:y0 + 2 * half, x0:x0 + 2 * half]
+    # area-preserving: keep the map's total (evidence) when shrinking
+    out = cv2.resize(c, (size, size), interpolation=cv2.INTER_AREA)
+    return out * (c.shape[0] * c.shape[1]) / float(size * size)
+
+
+def _radial_profile(m, size=AVG_SIZE, nbins=46):
+    """Evidence in each ring of r/R (rim at r/R = 1 sits at 1/1.2 of the half-width), as a
+    SUM over the ring, so the bands add up to the total score (a per-pixel mean would
+    exaggerate the small centre)."""
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
+    rr = np.hypot(xx - size / 2, yy - size / 2) / (size / 2 / 1.2)
+    edges = np.linspace(0, 1.2 * np.sqrt(2), nbins + 1)
+    idx = np.clip(np.digitize(rr, edges) - 1, 0, nbins - 1)
+    s = np.bincount(idx.ravel(), m.ravel(), nbins)
+    n = np.bincount(idx.ravel(), None, nbins)
+    r = (edges[:-1] + edges[1:]) / 2
+    keep = r <= R_MAX + 0.05
+    return r[keep], s[keep]
+
+
+def _pick(paths, max_n, seed=0):
+    if max_n and len(paths) > max_n:
+        rng = np.random.default_rng(seed)
+        return [paths[i] for i in sorted(rng.choice(len(paths), max_n, replace=False))]
+    return list(paths)
+
+
+def explain_average(model, paths, target, versus=None, max_n=40, qc_mode="microscope",
+                    downsample=None, log=print, progress=None, should_stop=lambda: False):
+    """Average feature-evidence maps for `target` over the droplets in `paths` (e.g. every
+    image of one whisky; a random max_n of them, default 40, ~1-3 s each). Droplets failing
+    QC are skipped. Scalar / radial models only (use cnn_map_average for CNN models)."""
+    if model.feature_set in ("cnn", "nuisance"):
+        raise ValueError("explain_average covers scalar / radial and cnn+scalar+radial; "
+                         "use cnn_map_average for a CNN-only model")
+    ds_ = downsample or model.info.get("downsample", DOWNSAMPLE)
+    use = _pick(list(paths), max_n)
+    heats, imgs, gm, gsum, probs, hits, skipped = [], [], {}, {}, [], [], []
+    parts = []                                         # (features part, CNN part) per droplet
+    for i, p in enumerate(use, 1):
+        if should_stop():
+            raise InterruptedError("stopped")
+        try:
+            d = analyse(p, downsample=ds_)
+            ok, why = (False, d.qc_reason) if d.seg is None else _qc(
+                d.seg, float(np.isfinite(d.polar[..., 0]).mean()), qc_mode)
+            if not ok:
+                skipped.append((d.name, why))
+                continue
+            e = explain(model, d, target=target, versus=versus, smooth=0)
+        except Exception as ex:  # noqa: BLE001
+            skipped.append((os.path.basename(p), str(ex)))
+            continue
+        heats.append(_crop_map(e.heat, d.seg))
+        parts.append((e.total - e.cnn_total, e.cnn_total))
+        img = view_normalised(d) if model.normalised else view_raw(d)
+        imgs.append(crop(img, d.seg, AVG_SIZE).astype(np.float32))
+        for g, m in e.group_maps.items():
+            gm[g] = gm.get(g, 0) + _crop_map(m, d.seg)
+        for g, c in e.groups:
+            gsum.setdefault(g, []).append(c)
+        probs.append(dict(e.top).get(target, 0.0) if target else e.probability)
+        hits.append(e.top[0][0] == e.target)
+        if progress:
+            progress(i, len(use))
+    if not heats:
+        raise ValueError("no usable droplet (all failed QC or had no droplet)")
+    H = np.stack(heats)
+    n = len(heats)
+    r, prof = _radial_profile(H.mean(0))
+    per = np.stack([_radial_profile(h)[1] for h in H])
+    groups = sorted(((g, float(np.mean(v + [0] * (n - len(v)))), float(np.std(v + [0] * (n - len(v)))))
+                     for g, v in gsum.items()), key=lambda t: -abs(t[1]))
+    cv2 = _cv2()
+    sig = AVG_SIZE / 150
+    return AverageExplanation(
+        target or "", versus or "average whisky", "features", n, skipped,
+        np.clip(np.mean(imgs, 0), 0, 255).astype(np.uint8),
+        cv2.GaussianBlur(H.mean(0), (0, 0), sig), H.std(0), r, prof, per.std(0), groups,
+        {g: cv2.GaussianBlur(m / n, (0, 0), sig) for g, m in gm.items()},
+        float(np.mean(probs)), float(np.mean(hits)),
+        *(float(v) for pair in zip(np.mean(parts, 0), np.std(parts, 0)) for v in pair))
+
+
+def cnn_map_average(model, paths, target, versus=None, max_n=40, downsample=None,
+                    log=print, progress=None, should_stop=lambda: False):
+    """Average CNN class-activation map (8 × 8 cells, crop frame) for `target` over
+    the droplets in `paths`. CNN models only. Exact per droplet (see cnn_map)."""
+    cv2 = _cv2()
+    ds_ = downsample or model.info.get("downsample", DOWNSAMPLE)
+    use = _pick(list(paths), max_n)
+    cells, imgs, probs, hits, skipped = [], [], [], [], []
+    for i, p in enumerate(use, 1):
+        if should_stop():
+            raise InterruptedError("stopped")
+        try:
+            cm = cnn_map(model, p, target=target, versus=versus, downsample=ds_)
+        except Exception as ex:  # noqa: BLE001
+            skipped.append((os.path.basename(p), str(ex)))
+            continue
+        cells.append(cm.cells)
+        imgs.append(cv2.resize(cm.crop, (AVG_SIZE, AVG_SIZE)).astype(np.float32))
+        probs.append(dict(cm.top).get(target, cm.probability) if target else cm.probability)
+        hits.append(cm.top[0][0] == cm.target)
+        if progress:
+            progress(i, len(use))
+    if not cells:
+        raise ValueError("no usable droplet")
+    C = np.stack(cells)
+    # upsample, then rescale so each map still sums to its droplet's CNN score
+    up = np.stack([cv2.resize(c, (AVG_SIZE, AVG_SIZE), interpolation=cv2.INTER_CUBIC) for c in C])
+    up *= C[0].size / float(AVG_SIZE * AVG_SIZE)
+    r, prof = _radial_profile(up.mean(0))
+    per = np.stack([_radial_profile(u)[1] for u in up])
+    return AverageExplanation(
+        target or "", versus or "average whisky", "cnn", len(cells), skipped,
+        np.clip(np.mean(imgs, 0), 0, 255).astype(np.uint8), up.mean(0), up.std(0), r, prof, per.std(0),
+        [], {}, float(np.mean(probs)), float(np.mean(hits)))
+
+
+def view_average_heat(a, alpha=0.7):
+    """Mean evidence over the average droplet: red = for a.target, blue = against."""
+    base = a.mean_image.astype(np.float32).mean(2, keepdims=True).repeat(3, 2) * 0.6
+    h = a.heat / (np.percentile(np.abs(a.heat), 99.5) + 1e-12)
+    h = (np.sign(h) * np.sqrt(np.clip(np.abs(h), 0, 1)))[..., None]
+    col = np.where(h > 0, np.array([255, 40, 30], np.float32), np.array([40, 120, 255], np.float32))
+    al = alpha * np.abs(h)
+    return np.clip(base * (1 - al) + col * al, 0, 255).astype(np.uint8)
+
+
+def view_average_groups(a, k=6, sign=+1, alpha=0.75):
+    """Top-k feature groups for (sign=+1) / against (-1), coloured, over the average droplet.
+    Returns (image, [(group, mean contribution, colour)])."""
+    base = a.mean_image.astype(np.float32) * 0.45
+    picked = [(g, c) for g, c, _ in a.groups if np.sign(c) == sign][:k]
+    out, legend = base.copy(), []
+    for i, (g, c) in enumerate(picked):
+        m = np.abs(a.group_maps.get(g, np.zeros(base.shape[:2])))
+        if (m > 0).any():
+            m = np.clip(m / (np.percentile(m[m > 0], 99) + 1e-12), 0, 1)
+        col = np.array(EXPLAIN_COLOURS[i % len(EXPLAIN_COLOURS)], np.float32)
+        al = (alpha * m)[..., None]
+        out = out * (1 - al) + col * al
+        legend.append((g, c, EXPLAIN_COLOURS[i % len(EXPLAIN_COLOURS)]))
+    return np.clip(out, 0, 255).astype(np.uint8), legend
+
+
+def figure_explain_average(avgs, names=None, k=6, dpi=150):
+    """One row per AverageExplanation (feature or CNN): average droplet | mean evidence
+    map | (features: top groups FOR / AGAINST; CNN: consistency map) | radial evidence
+    profile ± SD | ranked groups (features) or summary (CNN)."""
+    plt = _plt()
+    n = len(avgs)
+    fig, ax = plt.subplots(n, 5, figsize=(25, 4.7 * n), squeeze=False,
+                           gridspec_kw=dict(width_ratios=[1, 1, 1, 1.15, 1.4]))
+    for i, a in enumerate(avgs):
+        ax[i, 0].imshow(a.mean_image)
+        ax[i, 0].set_ylabel(_title(names, a.target, f"\n{a.kind}, n = {a.n}"), fontsize=10)
+        ax[i, 0].set_xlabel(f"mean p({a.target}) {a.probability:.2f} · predicted as {a.target}: {a.accuracy:.0%}",
+                            fontsize=8)
+        ax[i, 1].imshow(view_average_heat(a))
+        if a.kind == "features":
+            pos, lp = view_average_groups(a, k, +1)
+            ax[i, 2].imshow(pos)
+            ax[i, 2].set_title(f"top {k} groups FOR (mean)", fontsize=9)
+        else:
+            sd = a.heat_sd / (np.abs(a.heat).max() + 1e-12)
+            ax[i, 2].imshow(np.clip(sd, 0, 2), cmap="magma")
+            ax[i, 2].set_title("spread over droplets (SD / max |mean|)", fontsize=9)
+        ax[i, 3].plot(a.radial_r, a.radial, "k-", lw=1.4)
+        ax[i, 3].fill_between(a.radial_r, a.radial - a.radial_sd, a.radial + a.radial_sd, color="grey", alpha=0.3, lw=0)
+        ax[i, 3].fill_between(a.radial_r, 0, a.radial, where=a.radial > 0, color="tab:red", alpha=0.35, lw=0)
+        ax[i, 3].fill_between(a.radial_r, 0, a.radial, where=a.radial < 0, color="tab:blue", alpha=0.35, lw=0)
+        ax[i, 3].axhline(0, color="k", lw=0.5); ax[i, 3].axvline(1, color="grey", lw=0.6, ls=":")
+        ax[i, 3].set_xlabel("r / R (1 = rim)"); ax[i, 3].set_title("evidence in each r/R band (sums to the score; mean ± SD)", fontsize=9)
+        if a.kind == "features":
+            g = a.groups[:12][::-1]
+            ys = np.arange(len(g))
+            ax[i, 4].barh(ys, [c for _, c, _ in g], xerr=[s for _, _, s in g],
+                          color=["tab:red" if c > 0 else "tab:blue" for _, c, _ in g], ecolor="grey", capsize=2)
+            ax[i, 4].set_yticks(ys, [x for x, _, _ in g], fontsize=8)
+            ax[i, 4].axvline(0, color="k", lw=0.6)
+            ax[i, 4].set_xlabel(f"mean contribution to {a.target} vs {a.versus} (logit) ± SD", fontsize=8)
+        else:
+            ax[i, 4].axis("off")
+            ax[i, 4].text(0, 0.5, f"CNN evidence for {a.target} vs {a.versus}\naveraged over {a.n} droplets\n"
+                          f"(8 × 8 cells per droplet, exact).\n\nSkipped: {len(a.skipped)}", fontsize=10, va="center")
+        for j in range(3):
+            ax[i, j].set_xticks([]); ax[i, j].set_yticks([])
+    ax[0, 0].set_title("average droplet", fontsize=10)
+    ax[0, 1].set_title("mean evidence (red = for, blue = against)", fontsize=10)
+    fig.tight_layout()
+    return _to_pil(fig, dpi)

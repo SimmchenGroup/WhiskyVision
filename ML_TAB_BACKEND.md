@@ -169,7 +169,7 @@ sp.droplets                                   # the per-image Predictions
 
 ## Explanations: what the model uses on each image (17 Nov 2026)
 
-These are exact attribution maps for the **scalar, radial and scalar + radial** models; CNN sets aren't covered. The classifier is linear in its features, so a droplet's score splits exactly into one term per feature, and each term is painted onto the pixels that feature is computed from. (Checked: the terms plus the bias equal the model's score gap.)
+These are exact attribution maps for the **scalar, radial and scalar + radial** models, and (since 20 Nov) the named-feature half of **cnn + scalar + radial**; the CNN-only set isn't covered (use `cnn_map`). The classifier is linear in its features, so a droplet's score splits exactly into one term per feature, and each term is painted onto the pixels that feature is computed from. (Checked: the terms plus the bias equal the model's score gap.)
 
 ```python
 d = ml_core.analyse(path)
@@ -233,3 +233,64 @@ cc.image_info(path)                              # dict: collection, sample_numb
   - A drop-down at the top of the Gallery (and of Identify/ML if useful), listing `available_collections()` and defaulting to Khalifa.
   - Optional filter chips for volume (0.5 / 1 µL) and, in Different years, year. Both come from `image_info`.
   - The caption under each thumbnail from `image_caption`.
+
+## Model evaluation views: heat maps and CNN maps, per image and averaged over a sample (20 Nov 2026)
+
+Josh wants the ML tab to show **what a trained model uses**, on a **selected image** or **averaged over all images of a sample/whisky**. The backend is done; it needs a UI (e.g. an "Explain" panel next to Predict, with a "Selected image | Whole sample" switch).
+
+**Selected image** (as documented above):
+- `explain(model, analyse(path), target, versus)`, then `view_explain_heat` / `view_explain_groups` / `figure_explain`. For scalar, radial and (named-feature half of) cnn + scalar + radial models.
+- `cnn_map(model, path, target, versus)`, then `view_cnn_map`. For CNN and cnn + scalar + radial models (the CNN half).
+
+**Whole sample (new):**
+```python
+a = ml_core.explain_average(model, paths, target, versus=None, max_n=40, qc_mode="microscope",
+                            progress=..., should_stop=...)            # scalar / radial models
+a = ml_core.cnn_map_average(model, paths, target, versus=None, max_n=40, progress=..., should_stop=...)  # CNN models
+a.mean_image          # 256² average droplet (each droplet centred, scaled to the same rim)
+a.heat, a.heat_sd     # mean evidence map (+ = for target) and its SD over droplets
+a.radial_r, a.radial, a.radial_sd   # evidence in each r/R band (sums to the score), mean ± SD
+a.groups              # features only: [(group, mean contribution, SD)], ranked
+a.probability, a.accuracy, a.n, a.skipped
+ml_core.view_average_heat(a)                       # RGB, red for / blue against
+img, legend = ml_core.view_average_groups(a, k=6, sign=+1)   # features only
+ml_core.figure_explain_average([a1, a2, ...], names)         # one row per average (feature or CNN rows can be mixed)
+```
+- **`paths`:** the images of one sample. Use the Gallery's class list, or `collections_core.scan_collection(...)` for SWRI products. `target` is that sample's label.
+- **Cost:** about 1–3 s per droplet (feature) or about 4 s (CNN). `max_n` picks a random subset (default 40), so run it in a worker thread with progress. 20 droplets take about 1.5 min.
+- **Reading it:** droplets have random rotations, so the averages are roughly ring-shaped. The **band plot** (evidence against r/R) is the clearest summary. For example, H (Chivas 25) is carried by the rim band at r/R 0.9–1.15, while Y (Glengoyne 15) is carried by the interior and orange halo at 0.5–0.95.
+
+## Combined model (cnn + scalar + radial): the score split into its two halves (20 Nov 2026, front-end session)
+
+**Handover for the backend.** These changes were made in `ml_core.py` by the front-end session, at Josh's request. Please review them and keep them if you agree.
+
+**Why it's exact.** The model is standardise → PCA → logistic regression, all linear. So `components.T @ W` gives one weight per *original* feature, also for the combined set. A droplet's logit gap (target vs versus) is therefore exactly:
+
+> features part + CNN part + (b[target] − b[versus])
+
+where the features part is the sum of the scalar/radial terms and the CNN part is the sum of the 1,280 `cnn_*` terms. The PCA was fitted on both sets together, so the split says how *this model* divides the work, not which set would do better alone (compare the separate models for that).
+
+**What changed in `ml_core.py`:**
+- **`explain(model, d, ...)`**
+  - Now accepts `cnn+scalar+radial` (still refuses `cnn` and `nuisance`).
+  - For combined models it attaches the droplet's embedding with `add_embeddings([rec], model.info["downsample"])`. This is cached on disk; a first-time droplet costs one CNN pass.
+  - The `cnn_*` terms aren't painted onto pixels: `heat`, `group_maps`, `groups` and `features` are the named features only. Their sum is returned as the new field **`Explanation.cnn_total`**.
+  - `total` is still the whole sum (features + CNN). The features part is `total − cnn_total`.
+  - `cnn_total` defaults to 0.0, so nothing changes for scalar/radial models.
+- **`figure_explain`:** the bar-chart x-label adds "features … · CNN part … (not mapped)" when `cnn_total` is non-zero.
+- **`explain_average(...)`**
+  - Accepts the combined set too (refuses `cnn` and `nuisance`).
+  - New fields on **`AverageExplanation`**: `features_part`, `features_part_sd`, `cnn_part`, `cnn_part_sd`. These are the mean ± SD over droplets of the two halves, and they default to 0.0.
+  - `heat`, `radial` and `groups` cover the named features only.
+- **`cnn_map` / `cnn_map_average`:** unchanged. They already used only the `cnn_*` part of a combined model, so they give the CNN half's map.
+  - Note: the `cells` sum to the CNN part minus a constant, so `cm.total` is close to `e.cnn_total` but not equal (see the `CNNMap.total` comment).
+
+**Checked:** on a cnn + scalar + radial model trained on all Khalifa droplets, for one W droplet vs Y: features part + CNN part + bias difference = the model's logit gap, to rounding.
+
+**Not changed:** `VERSION` and `CNN_VERSION`, since no features or caches changed.
+
+**Front end (`ml_explain_gui.py`, the ML tab's Explain page):**
+- **Combined models are their own kind.** For one image it runs `explain` and then `cnn_map` with the same target and versus. For a sample it runs `explain_average` and then `cnn_map_average` over the same random droplets (`_pick` with the same seed), so it takes about 6 s per droplet.
+- **Views:** Evidence / For / Against (named features), CNN map (CNN half), Spread, Image / Average droplet.
+- **Score split:** the header shows "named features ± · CNN part ±", and the first bar is "CNN part (all 1,280 numbers)" in grey.
+
