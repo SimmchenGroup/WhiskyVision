@@ -40,6 +40,8 @@ CACHE_DIR = os.path.join(os.path.expanduser("~"), ".whisky_stitcher_thumbs")
 CACHE_EDGE = 320                               # stored thumbnail size (px)
 SIZES = {"Small": 130, "Medium": 190, "Large": 280}
 GAP, LABEL_H, HEAD_H, MARGIN = 14, 26, 46, 18
+WHEEL_PX = 150                # smooth scrolling: pixels per wheel notch
+GLIDE, FRAME_MS = 0.25, 15    # share of the remaining distance per frame, frame time
 X_R = 12                                       # radius of the remove button
 REMOVED_DIR = "_removed"
 
@@ -238,6 +240,10 @@ class GalleryTab:
         self.view = (0, 0)           # canvas y range being drawn (read by the loader)
         self._render_job = None
         self.select_mode = False
+        self._restore_y = None          # scroll position to put back after the next layout
+        self._keep_gen = None           # refresh generation that keeps the scroll position
+        self._wheel_target = None       # smooth scrolling: where the view is gliding to (px)
+        self._wheel_job = None
         self.selected = set()        # paths ticked in Select mode
         self._anchor = None          # last ticked path, for Shift-click ranges
         # collections (collections_core): Khalifa = the Identify tab's folder; SWRI by product
@@ -346,8 +352,8 @@ class GalleryTab:
         cv.configure(yscrollcommand=self._on_scroll)
         cv.bind("<Configure>", self._on_resize)
         cv.bind("<MouseWheel>", self._on_wheel)
-        cv.bind("<Button-4>", lambda e: cv.yview_scroll(-3, "units"))   # Linux
-        cv.bind("<Button-5>", lambda e: cv.yview_scroll(3, "units"))
+        cv.bind("<Button-4>", lambda e: self._glide(-WHEEL_PX))   # Linux
+        cv.bind("<Button-5>", lambda e: self._glide(WHEEL_PX))
         cv.bind("<Motion>", self._on_motion)
         cv.bind("<Leave>", lambda e: self._set_hover(None))
         cv.bind("<Button-1>", self._on_click)
@@ -416,8 +422,10 @@ class GalleryTab:
         self.app._save_settings()
         self.refresh()
 
-    def refresh(self, force=False):
-        """Scan the current collection in the background (SWRI scans take seconds on J:)."""
+    def refresh(self, force=False, keep_view=False):
+        """Scan the current collection in the background (SWRI scans take seconds on J:).
+        keep_view: keep showing the current pictures while it rescans, and stay at the
+        same place afterwards (used after removing images)."""
         folder = self.folder()
         key = (self.collection, folder)
         if not force and key == self.shown_folder:
@@ -430,11 +438,15 @@ class GalleryTab:
         if force:
             self.thumbs.clear()
             self.photos.clear()
-        self.groups, self.unstitched = [], []
-        self.loading = bool(folder and os.path.isdir(folder))
-        self._schedule_layout(0)
-        if not self.loading:
-            return
+        if keep_view and self.groups and folder and os.path.isdir(folder):
+            self._keep_gen = gen
+        else:
+            self._keep_gen = None
+            self.groups, self.unstitched = [], []
+            self.loading = bool(folder and os.path.isdir(folder))
+            self._schedule_layout(0)
+            if not self.loading:
+                return
 
         def work():
             try:
@@ -492,6 +504,9 @@ class GalleryTab:
             if gen != self.generation:
                 return
             self.loading = False
+            if gen == self._keep_gen:           # a rescan after a removal: stay where we were
+                self._keep_gen = None
+                self._remember_view()
             if err:
                 self.summary.configure(text=f"Couldn't read the folder: {err}")
                 self._schedule_layout(0)
@@ -561,6 +576,7 @@ class GalleryTab:
         """Scroll so that whisky's section is at the top ("" = back to the top)."""
         y = next((gy for gy, c in self.group_y if c == code), 0) if code else 0
         self._jumped = time.monotonic()     # keep the clicked whisky highlighted
+        self._stop_glide()
         self.canvas.yview_moveto(y / max(1, self.content_h))
         self._set_nav_active(code)
 
@@ -586,8 +602,52 @@ class GalleryTab:
             self._schedule_layout(80)
 
     def _on_wheel(self, e):
-        step = -int(e.delta / 120) if abs(e.delta) >= 120 else (-1 if e.delta > 0 else 1)
-        self.canvas.yview_scroll(step * 2, "units")
+        notches = -e.delta / 120 if abs(e.delta) >= 120 else (-1 if e.delta > 0 else 1)
+        self._glide(notches * WHEEL_PX)
+
+    # Smooth scrolling: the wheel moves a target and the view eases towards it
+    # (about 60 frames a second), instead of jumping a step per notch.
+    def _max_top(self):
+        return max(0.0, self.content_h - max(self.canvas.winfo_height(), 1))
+
+    def _glide(self, dy):
+        cv = self.canvas
+        if self._wheel_target is None:
+            self._wheel_target = cv.canvasy(0)
+        self._wheel_target = min(max(0.0, self._wheel_target + dy), self._max_top())
+        if self._wheel_job is None:
+            self._wheel_job = self.app.after(0, self._glide_step)
+
+    def _glide_step(self):
+        self._wheel_job = None
+        if self._wheel_target is None:
+            return
+        cv = self.canvas
+        cur = cv.canvasy(0)
+        gap = self._wheel_target - cur
+        if abs(gap) < 1:
+            cv.yview_moveto(self._wheel_target / max(1, self.content_h))
+            self._wheel_target = None
+            return
+        step = gap * GLIDE
+        if abs(step) < 1:
+            step = 1 if gap > 0 else -1
+        cv.yview_moveto((cur + step) / max(1, self.content_h))
+        if abs(cv.canvasy(0) - cur) < 0.5:       # hit the end: stop
+            self._wheel_target = None
+            return
+        self._wheel_job = self.app.after(FRAME_MS, self._glide_step)
+
+    def _stop_glide(self):
+        self._wheel_target = None
+        if self._wheel_job:
+            self.app.after_cancel(self._wheel_job)
+            self._wheel_job = None
+
+    def _remember_view(self):
+        """Put the view back at this place after the next layout (removing, restitching)."""
+        if self.tiles:
+            self._restore_y = self.canvas.canvasy(0)
 
     def _schedule_layout(self, delay=100):
         if self._layout_job:
@@ -737,6 +797,10 @@ class GalleryTab:
         self.px = px
         self.content_h = y + 10
         cv.configure(scrollregion=(0, 0, W, self.content_h))
+        if self._restore_y is not None:
+            self._stop_glide()
+            cv.yview_moveto(min(self._restore_y, self._max_top()) / max(1, self.content_h))
+            self._restore_y = None
         self._update_sel_bar()
         self._render_visible()
 
@@ -985,6 +1049,7 @@ class GalleryTab:
             if old in self.info:
                 self.info[new] = self.info.pop(old)
                 self.captions[new] = self.captions.pop(old, self.caption(new))
+        self._remember_view()
         self._schedule_layout(0)
 
     # ----------------------------------------------------------- remove
@@ -1022,18 +1087,21 @@ class GalleryTab:
                                                       "and stitch it again.")
 
     def _forget(self, paths):
-        """Images were moved out: update the cached scans instead of re-reading the folders."""
+        """Images were moved out: update the cached scans instead of re-reading the folders.
+        The pictures disappear at once and the Gallery stays where it was."""
+        gone = set(paths)
+        self.groups = [(c, [p for p in ps if p not in gone]) for c, ps in self.groups]
+        self.groups = [(c, ps) for c, ps in self.groups if ps]
+        self._remember_view()
         if self.swri():
-            gone = set(paths)
-            self.groups = [(c, [p for p in ps if p not in gone]) for c, ps in self.groups]
-            self.groups = [(c, ps) for c, ps in self.groups if ps]
             with cc._lock:
                 cc._scan_cache.clear()           # every SWRI collection may hold these images
             self._schedule_layout(0)
             return
         idc.forget_images(self.folder(), paths)
+        self._schedule_layout(0)
         self.shown_folder = None
-        self.refresh()
+        self.refresh(keep_view=True)
         self.identify._scan_database(quiet=True)
 
     def remove_selected(self):
