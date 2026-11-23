@@ -1060,6 +1060,70 @@ def cnn_available():
                 "pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu")
 
 
+def _ssl_contexts():
+    """SSL contexts to retry the weights download with when Python's own certificate check
+    fails (university / company networks that inspect HTTPS, or Pythons without the
+    system certificates): the operating system's store via truststore if installed,
+    then the certifi bundle (or pip's copy of it)."""
+    import ssl
+    out = []
+    try:
+        import truststore
+        out.append(("system certificates", truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)))
+    except Exception:  # noqa: BLE001
+        pass
+    for mod in ("certifi", "pip._vendor.certifi"):
+        try:
+            import importlib
+            out.append(("certifi", ssl.create_default_context(cafile=importlib.import_module(mod).where())))
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _load_efficientnet(torchvision):
+    """EfficientNet-B0 with ImageNet weights. The weights (~20 MB) are downloaded once into
+    PyTorch's cache; if the download fails on a certificate error, retry with other
+    certificate stores, and failing that say how to copy the file over by hand."""
+    W = torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1
+    try:
+        return torchvision.models.efficientnet_b0(weights=W)
+    except Exception as e:  # noqa: BLE001
+        if "CERTIFICATE_VERIFY_FAILED" not in str(e) and "SSL" not in str(e):
+            raise
+        first = e
+    import shutil
+    import urllib.request
+    import torch.hub
+    dst = os.path.normpath(os.path.join(torch.hub.get_dir(), "checkpoints", os.path.basename(W.url)))
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tried = []
+    for name, ctx in _ssl_contexts():
+        tmp = dst + ".part"
+        try:
+            with urllib.request.urlopen(W.url, context=ctx, timeout=60) as r, open(tmp, "wb") as fh:
+                shutil.copyfileobj(r, fh)
+            os.replace(tmp, dst)
+            return torchvision.models.efficientnet_b0(weights=W)      # now found in the cache
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{name}: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    raise RuntimeError(
+        "Couldn't download the CNN's pretrained weights: this network or Python doesn't trust the "
+        f"download site's certificate ({first}).\n\n"
+        "Fix it either way:\n"
+        "  • Install truststore (lets Python use Windows'/macOS' own certificates), then try again:\n"
+        "      python -m pip install truststore\n"
+        f"  • Or copy the file {os.path.basename(W.url)} (about 20 MB) from a computer where the CNN "
+        f"already works, or download it in a browser from\n      {W.url}\n"
+        f"    and put it here:\n      {dst}"
+        + (f"\n\nAlso tried: {'; '.join(tried)}" if tried else ""))
+
+
 def _cnn_net():
     """The network, loaded once. The ImageNet weights (~20 MB) are downloaded on first
     use into PyTorch's cache (~/.cache/torch)."""
@@ -1068,7 +1132,7 @@ def _cnn_net():
             import torch
             import torchvision
             torch.set_num_threads(max(1, os.cpu_count() or 1))
-            net = torchvision.models.efficientnet_b0(weights="IMAGENET1K_V1")
+            net = _load_efficientnet(torchvision)
             net.classifier = torch.nn.Identity()
             net.eval()
             _cnn["net"] = net

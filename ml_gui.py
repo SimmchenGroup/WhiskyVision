@@ -1315,6 +1315,12 @@ class MLTab:
                         self.app.events.put(("ml_status", line[:110]))
             if p.wait() != 0:
                 raise RuntimeError("pip failed; see Show log for the details")
+            # truststore lets Python use the computer's own certificates, so the CNN weights
+            # download also works on networks that inspect HTTPS. Optional: ignore failures.
+            extra = [a for a in cmd if a not in ("torch", "torchvision", "--index-url", TORCH_INDEX)]
+            self._bg_log("$ " + " ".join(extra + ["truststore"]))
+            subprocess.run(extra + ["truststore"], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             import importlib
             importlib.invalidate_caches()
             return mc.cnn_available()

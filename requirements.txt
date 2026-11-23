@@ -9,3 +9,5 @@ matplotlib                  # ML tab figures only (ml_core.figure_*); the rest o
 # Optional, for the ML tab's pretrained-CNN feature sets only (CPU build, about 1 GB).
 # Easiest: the ML tab's "Install PyTorch..." link installs it into the right Python. Or:
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# If the first CNN run fails with CERTIFICATE_VERIFY_FAILED (networks that inspect HTTPS):
+#   pip install truststore
