@@ -1204,6 +1204,7 @@ def add_embeddings(records, downsample=DOWNSAMPLE, log=print, progress=None, sho
     _cnn_net()
     os.makedirs(os.path.join(CACHE_DIR, "cnn"), exist_ok=True)
     done = 0
+    failed = {}                              # whisky -> (count, first reason)
     batches = [todo[i:i + CNN_BATCH] for i in range(0, len(todo), CNN_BATCH)]
     with ThreadPoolExecutor(workers) as pool:
         # Images for the next batches are read while the CNN works on this one
@@ -1228,6 +1229,8 @@ def add_embeddings(records, downsample=DOWNSAMPLE, log=print, progress=None, sho
             for r, c in zip(chunk, crops):
                 if not isinstance(c, tuple):
                     log(f"  no CNN embedding for {r.name}: {c or 'no droplet found'}")
+                    n, why = failed.get(r.label, (0, c or "no droplet found"))
+                    failed[r.label] = (n + 1, why)
             if ok:
                 e_raw = embed_crops([c[0] for _, c in ok], gain=2.5)
                 e_norm = embed_crops([c[1] for _, c in ok], gain=1.0)
@@ -1244,6 +1247,15 @@ def add_embeddings(records, downsample=DOWNSAMPLE, log=print, progress=None, sho
             done += len(chunk)
             if progress:
                 progress(done, len(todo))
+    if failed:
+        from identify_core import code_order
+        log(f"CNN embeddings: {sum(n for n, _ in failed.values())} droplets failed, by whisky:")
+        for lab in sorted(failed, key=lambda l: code_order(l or "")):
+            n, why = failed[lab]
+            log(f"  {lab}: {n} (e.g. {why})")
+        log("  These droplets are left out of the CNN runs (the control doesn't need the CNN, so it "
+            "keeps them). Usually the images can't be read again on this computer: check the image "
+            "folder is reachable and its files are downloaded (OneDrive/iCloud 'online only').")
     return len(todo)
 
 
@@ -1591,21 +1603,34 @@ def _usable(ds, min_per_class, feature_set=""):
     for r in ds.records:
         if not r.qc_ok:
             excluded[r.qc_reason.split(" (")[0]] = excluded.get(r.qc_reason.split(" (")[0], 0) + 1
+    from identify_core import code_order
+    no_cnn = set()
     if "cnn" in feature_set:
         if all(r.cnn is None for r in recs):
             raise ValueError("CNN embeddings are missing: call add_embeddings(ds.records) first")
-        n = sum(r.cnn is None for r in recs)
-        if n:
-            excluded["no CNN embedding"] = n
+        missing = [r for r in recs if r.cnn is None]
+        if missing:
+            # Whiskies pushed under min_per_class only because their CNN embeddings are
+            # missing (images unreadable on this computer, e.g. a drive not mounted or
+            # cloud-only files): name them, or they look like whiskies with too few droplets.
+            n_all, n_cnn = {}, {}
+            for r in recs:
+                n_all[r.label] = n_all.get(r.label, 0) + 1
+                if r.cnn is not None:
+                    n_cnn[r.label] = n_cnn.get(r.label, 0) + 1
+            no_cnn = {l for l, n in n_all.items() if n >= min_per_class > n_cnn.get(l, 0)}
+            why = "no CNN embedding (image couldn't be read again; see the log)"
+            if no_cnn:
+                why += " · whiskies lost: " + ", ".join(sorted(no_cnn, key=code_order))
+            excluded[why] = len(missing)
         recs = [r for r in recs if r.cnn is not None]
     counts = {}
     for r in recs:
         counts[r.label] = counts.get(r.label, 0) + 1
     small = {l for l, n in counts.items() if n < min_per_class}
-    if small:
-        excluded[f"whisky with fewer than {min_per_class} good droplets"] = sum(counts[l] for l in small)
+    if small - no_cnn:
+        excluded[f"whisky with fewer than {min_per_class} good droplets"] = sum(counts[l] for l in small - no_cnn)
     recs = [r for r in recs if r.label not in small]
-    from identify_core import code_order
     classes = sorted({r.label for r in recs}, key=code_order)
     return recs, classes, excluded, sorted(small, key=code_order)
 
